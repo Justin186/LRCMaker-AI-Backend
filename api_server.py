@@ -13,8 +13,9 @@ import stable_whisper
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 if getattr(sys, 'frozen', False):
-    application_path = sys._MEIPASS if hasattr(sys, '_MEIPASS') else os.path.dirname(sys.executable)
-    os.environ["PATH"] = application_path + os.pathsep + os.environ.get("PATH", "")
+    application_path = os.path.dirname(sys.executable)
+    env_path = sys._MEIPASS if hasattr(sys, '_MEIPASS') else application_path
+    os.environ["PATH"] = env_path + os.pathsep + os.environ.get("PATH", "")
 else:
     application_path = os.path.dirname(os.path.abspath(__file__))
 

@@ -17,7 +17,7 @@ if [ "$choice" == "1" ]; then
 elif [ "$choice" == "2" ]; then
     read -p "👉 请输入新版本号 (例如 2.0, 不需要输入v): " version
     full_version="v$version"
-    m1_zip_name="LRCMaker-AI-Backend-Mac-Arm64-$full_version.zip"
+    arm64_zip_name="LRCMaker-AI-Backend-Mac-Arm64-$full_version.zip"
     intel_zip_name="LRCMaker-AI-Backend-Mac-Intel-$full_version.zip"
     mac_zip_name="LRCMaker-AI-Backend-Mac-$full_version.zip"
 
@@ -79,11 +79,11 @@ elif [ "$choice" == "2" ]; then
 
     DUAL_BUILD=false
 
-    if [ -d "m1_venv" ] && [ -d "intel_venv" ]; then
+    if [ -d "arm64_venv" ] && [ -d "intel_venv" ]; then
         DUAL_BUILD=true
         echo ">>> 检测到双架构虚拟环境，开始分别构建 Mac Arm64 和 Intel 版本..."
         
-        source m1_venv/bin/activate
+        source arm64_venv/bin/activate
         python3 -m PyInstaller "${PYINSTALLER_BASE_ARGS[@]}" --name "LRCMaker_Backend_Mac_Arm64" api_server.py || { echo "❌ Mac Arm64 打包失败！"; exit 1; }
         deactivate
 
@@ -92,7 +92,7 @@ elif [ "$choice" == "2" ]; then
         deactivate
         
     elif [ -d "venv" ]; then
-        echo ">>> ⚠️ 未检测到 m1_venv/intel_venv，但发现了常规 venv。"
+        echo ">>> ⚠️ 未检测到 arm64_venv/intel_venv，但发现了常规 venv。"
         echo ">>> 将自动降级，仅构建当前系统架构的单版本 Mac 包..."
         
         source venv/bin/activate
@@ -108,7 +108,7 @@ elif [ "$choice" == "2" ]; then
     echo "正在拉取 faster-whisper-small 模型，塞入发布包中..."
     
     if [ "$DUAL_BUILD" = true ]; then
-        source m1_venv/bin/activate
+        source arm64_venv/bin/activate
         python3 -m pip install huggingface_hub
         echo ">>> 注入 M 芯片版..."
         python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Systran/faster-whisper-small', local_dir='dist/LRCMaker_Backend_Mac_Arm64/models/faster-whisper-small')"
@@ -127,9 +127,9 @@ elif [ "$choice" == "2" ]; then
     echo "打包与模型植入成功！正在压缩 Mac 版本包 (保留系统软链接)..."
     cd dist
     if [ "$DUAL_BUILD" = true ]; then
-        zip -ry "$m1_zip_name" LRCMaker_Backend_Mac_Arm64
+        zip -ry "$arm64_zip_name" LRCMaker_Backend_Mac_Arm64
         zip -ry "$intel_zip_name" LRCMaker_Backend_Mac_Intel
-        echo "✅ Mac Arm64 版本已生成至: dist/$m1_zip_name"
+        echo "✅ Mac Arm64 版本已生成至: dist/$arm64_zip_name"
         echo "✅ Mac Intel 版本已生成至: dist/$intel_zip_name"
     else
         zip -ry "$mac_zip_name" LRCMaker_Backend_Mac

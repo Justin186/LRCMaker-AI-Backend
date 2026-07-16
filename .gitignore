@@ -12,4 +12,5 @@ models/
 ffmpeg_temp/
 ffmpeg
 ffprobe
+switch_env.sh
 .DS_Store
