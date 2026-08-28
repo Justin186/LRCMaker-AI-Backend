@@ -1,0 +1,420 @@
+// ==UserScript==
+// @name         LRC-Maker AI 辅助对齐 (配合本地引擎)
+// @namespace    https://github.com/Flare-Sky/LRCMaker-AI-Backend
+// @version      2.1
+// @description  利用本地 AI 算力自动生成 LRC 歌词，支持普通/逐字双模式，内置纯原生沉浸式 KTV 逐字染色可视化预览视窗！加入了智能端口嗅探与全局音频捕获功能。
+// @author       Flare-Sky
+// @match        https://lrc-maker.github.io/*
+// @grant        GM_setClipboard
+// @license      MIT
+// @downloadURL https://update.greasyfork.org/scripts/579199/LRC-Maker%20AI%20%E8%BE%85%E5%8A%A9%E5%AF%B9%E9%BD%90%20%28%E9%85%8D%E5%90%88%E6%9C%AC%E5%9C%B0%E5%BC%95%E6%93%8E%29.user.js
+// @updateURL https://update.greasyfork.org/scripts/579199/LRC-Maker%20AI%20%E8%BE%85%E5%8A%A9%E5%AF%B9%E9%BD%90%20%28%E9%85%8D%E5%90%88%E6%9C%AC%E5%9C%B0%E5%BC%95%E6%93%8E%29.meta.js
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const style = document.createElement('style');
+    style.innerHTML = `
+        .ktv-word {
+            position: relative;
+            display: inline-block;
+            color: #555;
+            font-size: 18px;
+            font-weight: bold;
+            margin-right: 2px;
+            transition: color 0.3s;
+        }
+        .ktv-word::after {
+            content: attr(data-text);
+            position: absolute;
+            left: 0;
+            top: 0;
+            color: #00ff88;
+            width: var(--progress, 0%);
+            overflow: hidden;
+            white-space: nowrap;
+        }
+        .ktv-line {
+            padding: 8px;
+            text-align: center;
+            border-radius: 6px;
+            transition: background 0.3s;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .ktv-line.active {
+            background: rgba(255, 255, 255, 0.1);
+        }
+        .ktv-line.active .ktv-word {
+            transform: scale(1.05);
+        }
+        #ktv-audio {
+            width: calc(100% - 30px) !important;
+            height: 35px !important;
+            outline: none !important;
+            display: block !important;
+            margin: 0 auto 15px auto !important;
+        }
+        #ktv-audio::-webkit-media-controls-enclosure {
+            border-radius: 6px;
+        }
+        #ktv-audio::-webkit-media-controls-panel {
+            background-color: #2b2b36;
+        }
+        #ktv-audio::-webkit-media-controls-current-time-display,
+        #ktv-audio::-webkit-media-controls-time-remaining-display {
+            color: #fff;
+        }
+    `;
+    document.head.appendChild(style);
+
+    const panelHTML = `
+        <div id="ai-lrc-panel" style="position: fixed; bottom: 20px; left: 20px; width: 400px; box-sizing: border-box; background: #fff; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); padding: 15px; z-index: 9999; font-family: sans-serif; color: #333; border: 1px solid #eee; display: flex; flex-direction: column;">
+            <h3 id="ai-panel-header" style="margin: 0 0 10px 0; font-size: 15px; border-bottom: 1px solid #eee; padding-bottom: 8px; display: flex; justify-content: space-between; cursor: move; user-select: none;">
+                <span>🤖 AI 歌词对齐引擎 <span style="font-size: 11px; color: #888;">(Alt+A)</span></span>
+                <span id="ai-close-btn" style="cursor:pointer; color:#999; font-size: 13px;">[隐藏]</span>
+            </h3>
+
+            <div style="display: flex; gap: 5px; margin-bottom: 8px;">
+                <input type="text" id="ai-ti" placeholder="歌名 ti" style="width: 33%; padding: 4px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box;">
+                <input type="text" id="ai-ar" placeholder="歌手 ar" style="width: 33%; padding: 4px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box;">
+                <input type="text" id="ai-al" placeholder="专辑 al" style="width: 33%; padding: 4px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box;">
+            </div>
+
+            <textarea id="ai-lyrics" placeholder="在此粘贴纯文本歌词（自动无视带冒号的 Staff 信息，支持 --- 分隔符）" style="width: 100%; height: 100px; padding: 6px; border: 1px solid #ccc; border-radius: 4px; margin-bottom: 10px; resize: vertical; box-sizing: border-box; font-size: 12px;"></textarea>
+
+            <div style="display: flex; margin-bottom: 10px; border-radius: 4px; overflow: hidden; border: 1px solid #4CAF50;">
+                <div id="ai-tab-standard" style="flex: 1; text-align: center; padding: 6px; background: #4CAF50; color: white; cursor: pointer; font-size: 12px; font-weight: bold; transition: 0.2s;">普通单句 LRC</div>
+                <div id="ai-tab-enhanced" style="flex: 1; text-align: center; padding: 6px; background: #fff; color: #4CAF50; cursor: pointer; font-size: 12px; font-weight: bold; transition: 0.2s;">逐字动感 KTV</div>
+            </div>
+
+            <button id="ai-btn-align" style="width: 100%; background: #2196F3; color: white; border: none; padding: 10px; border-radius: 4px; cursor: pointer; font-weight: bold; transition: background 0.3s;">
+                🚀 一键 AI 强制对齐
+            </button>
+            <div id="ai-status" style="margin-top: 8px; font-size: 12px; color: #666; text-align: center;">请先在网页加载音频</div>
+
+            <div id="ktv-preview-container" style="display: none; margin-top: 15px; width: 100%; min-width: 0; box-sizing: border-box; background: #1e1e24; border-radius: 8px; overflow: hidden; box-shadow: inset 0 0 10px rgba(0,0,0,0.5);">
+                <div style="background: #2b2b36; padding: 5px 10px; font-size: 12px; color: #aaa; display: flex; justify-content: space-between;">
+                    <span>🎤 KTV 沉浸预览视窗</span>
+                </div>
+                <div id="ktv-lyrics-display" style="height: 120px; overflow-y: auto; padding: 15px 10px; display: flex; flex-direction: column; gap: 10px; scroll-behavior: smooth; min-width: 0;">
+                </div>
+                <audio id="ktv-audio" controls></audio>
+            </div>
+        </div>
+    `;
+
+    const div = document.createElement('div');
+    div.innerHTML = panelHTML;
+    document.body.appendChild(div);
+
+    const panel = document.getElementById('ai-lrc-panel');
+    const header = document.getElementById('ai-panel-header');
+    const btnClose = document.getElementById('ai-close-btn');
+    const btnAlign = document.getElementById('ai-btn-align');
+    const statusTxt = document.getElementById('ai-status');
+    const lyricsInput = document.getElementById('ai-lyrics');
+
+    let currentMode = 'standard';
+    let cachedStandardLrc = '';
+    let cachedEnhancedLrc = '';
+    let parsedKtvData = [];
+    let audioBlobUrl = null;
+
+    const previewContainer = document.getElementById('ktv-preview-container');
+    const ktvDisplay = document.getElementById('ktv-lyrics-display');
+    const ktvAudio = document.getElementById('ktv-audio');
+
+    document.addEventListener('keydown', (e) => {
+        if (e.altKey && e.code === 'KeyA') {
+            e.preventDefault();
+            panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+        }
+    });
+
+    btnClose.addEventListener('click', () => panel.style.display = 'none');
+
+    let isDragging = false, offsetX, offsetY;
+    header.addEventListener('mousedown', (e) => {
+        isDragging = true;
+        const rect = panel.getBoundingClientRect();
+        offsetX = e.clientX - rect.left;
+        offsetY = e.clientY - rect.top;
+        panel.style.bottom = 'auto';
+        panel.style.right = 'auto';
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (!isDragging) return;
+        panel.style.left = (e.clientX - offsetX) + 'px';
+        panel.style.top = (e.clientY - offsetY) + 'px';
+    });
+
+    document.addEventListener('mouseup', () => isDragging = false);
+
+    function switchTab(mode) {
+        currentMode = mode;
+        const tabStd = document.getElementById('ai-tab-standard');
+        const tabEnh = document.getElementById('ai-tab-enhanced');
+        if (mode === 'standard') {
+            tabStd.style.background = '#4CAF50'; tabStd.style.color = 'white';
+            tabEnh.style.background = '#fff'; tabEnh.style.color = '#4CAF50';
+            previewContainer.style.display = 'none';
+        } else {
+            tabEnh.style.background = '#4CAF50'; tabEnh.style.color = 'white';
+            tabStd.style.background = '#fff'; tabStd.style.color = '#4CAF50';
+            if (cachedEnhancedLrc) previewContainer.style.display = 'block';
+        }
+        if (cachedStandardLrc) applyLrcToEditor();
+    }
+
+    document.getElementById('ai-tab-standard').addEventListener('click', () => switchTab('standard'));
+    document.getElementById('ai-tab-enhanced').addEventListener('click', () => switchTab('enhanced'));
+
+    function applyLrcToEditor() {
+        const targetContent = currentMode === 'standard' ? cachedStandardLrc : cachedEnhancedLrc;
+        if (!targetContent) return;
+        if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(targetContent, 'text');
+        else navigator.clipboard.writeText(targetContent);
+
+        const targetTextarea = document.querySelector('textarea:not(#ai-lyrics)');
+        if (targetTextarea) {
+            targetTextarea.value = targetContent;
+            targetTextarea.dispatchEvent(new Event('input', { bubbles: true }));
+            targetTextarea.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    }
+
+    function parseEnhancedLrc(lrc) {
+        const lines = [];
+        // ESLRC 风格：行首 [mm:ss.xx] 为行起始时间，每个词后跟 [mm:ss.xx] 为该词结束时间
+        // 例：[00:12.34]我[00:13.00]爱[00:13.50]你[00:14.20]
+        const lineStartReg = /^\[(\d{2}):(\d{2}\.\d{2})\]/;
+        const wordReg = /([^\[\]]+)\[(\d{2}):(\d{2}\.\d{2})\]/g;
+
+        lrc.split('\n').forEach(lineStr => {
+            const line = { words: [] };
+            const lineStartMatch = lineStartReg.exec(lineStr);
+            const lineStart = lineStartMatch
+                ? parseInt(lineStartMatch[1]) * 60 + parseFloat(lineStartMatch[2])
+                : null;
+
+            let match;
+            wordReg.lastIndex = 0;
+            while ((match = wordReg.exec(lineStr)) !== null) {
+                const text = match[1].trim();
+                const end = parseInt(match[2]) * 60 + parseFloat(match[3]);
+                if (text) {
+                    const start = line.words.length > 0
+                        ? line.words[line.words.length - 1].end
+                        : (lineStart !== null ? lineStart : end);
+                    line.words.push({ start: start, text: text, end: end });
+                }
+            }
+            if (line.words.length > 0) lines.push(line);
+        });
+        return lines;
+    }
+
+    function buildKtvStage() {
+        ktvDisplay.innerHTML = '';
+        parsedKtvData = parseEnhancedLrc(cachedEnhancedLrc);
+
+        parsedKtvData.forEach((line, lineIdx) => {
+            const lineDiv = document.createElement('div');
+            lineDiv.className = 'ktv-line';
+            lineDiv.id = `ktv-line-${lineIdx}`;
+
+            line.words.forEach(word => {
+                const span = document.createElement('span');
+                span.className = 'ktv-word';
+                span.setAttribute('data-text', word.text);
+                span.setAttribute('data-start', word.start);
+                span.setAttribute('data-end', word.end);
+                span.innerText = word.text;
+                lineDiv.appendChild(span);
+            });
+            ktvDisplay.appendChild(lineDiv);
+        });
+    }
+
+    let animationFrameId = null;
+    let activeLineIndex = -1;
+
+    function renderLoop() {
+        if (ktvAudio.paused) return;
+
+        const currentTime = ktvAudio.currentTime;
+        const words = document.querySelectorAll('.ktv-word');
+
+        words.forEach(word => {
+            const start = parseFloat(word.getAttribute('data-start'));
+            const end = parseFloat(word.getAttribute('data-end'));
+
+            if (currentTime < start) {
+                word.style.setProperty('--progress', '0%');
+            } else if (currentTime > end) {
+                word.style.setProperty('--progress', '100%');
+            } else {
+                const percent = ((currentTime - start) / (end - start)) * 100;
+                word.style.setProperty('--progress', `${percent}%`);
+
+                const parentLine = word.parentElement;
+                const lineId = parentLine.id;
+                const lineIdx = parseInt(lineId.split('-')[2]);
+
+                if (activeLineIndex !== lineIdx) {
+                    activeLineIndex = lineIdx;
+                    document.querySelectorAll('.ktv-line').forEach(l => l.classList.remove('active'));
+                    parentLine.classList.add('active');
+                    parentLine.scrollIntoView({ behavior: "smooth", block: "center" });
+                }
+            }
+        });
+
+        animationFrameId = requestAnimationFrame(renderLoop);
+    }
+
+    ktvAudio.addEventListener('play', () => {
+        animationFrameId = requestAnimationFrame(renderLoop);
+    });
+
+    ktvAudio.addEventListener('seeked', () => {
+        renderLoop();
+    });
+
+    async function findActiveBackendPort(startPort = 8000, maxTries = 10) {
+        for (let port = startPort; port < startPort + maxTries; port++) {
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 300);
+
+                const response = await fetch(`http://127.0.0.1:${port}/api/ping`, {
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.app === "lrc-maker-ai") {
+                        console.log(`✅ 成功探测到 AI 后端运行在端口: ${port}`);
+                        return port;
+                    }
+                }
+            } catch (e) {
+                console.log(`端口 ${port} 未响应，尝试下一个...`);
+            }
+        }
+        throw new Error("未探测到运行中的本地 AI 引擎，请确认黑框程序已启动！");
+    }
+
+    btnAlign.addEventListener('click', async () => {
+        let audioFile = null;
+
+        // 🌟 v2.1 终极绝招：直接从 LRC-Maker 网页的播放器中拦截 Blob 数据 (无视用户的载入方式)
+        const pageAudio = document.querySelector('audio:not(#ktv-audio)'); 
+        if (pageAudio && pageAudio.src && pageAudio.src.startsWith('blob:')) {
+            try {
+                btnAlign.disabled = true;
+                btnAlign.style.background = '#9e9e9e';
+                btnAlign.innerText = '📡 正在准备音频数据...';
+                
+                const response = await fetch(pageAudio.src);
+                const blob = await response.blob();
+                audioFile = new File([blob], "audio_intercepted.wav", { type: blob.type }); 
+                console.log("✅ 成功从网页播放器中提取到音频 Blob!");
+            } catch (e) {
+                console.log("⚠️ 从 Blob 提取音频失败，准备回退查找", e);
+            }
+        }
+
+        // 🛡️ 备用方案：如果上面失败了，再回退到传统的 input 标签查找
+        if (!audioFile) {
+            const fileInputs = document.querySelectorAll('input[type="file"]');
+            for (let input of fileInputs) {
+                if (input.files && input.files.length > 0) {
+                    const file = input.files[0];
+                    if (file.type.startsWith('audio/') || file.name.endsWith('.mp3') || file.name.endsWith('.wav')) {
+                        audioFile = file;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!audioFile) {
+            alert('❌ 找不到音频文件！请确认是否已在网页左下角载入音频（或直接拖拽）。');
+            btnAlign.disabled = false;
+            btnAlign.style.background = '#2196F3';
+            btnAlign.innerText = '🚀 一键 AI 强制对齐';
+            return;
+        }
+
+        const lyricsText = lyricsInput.value.trim();
+        if (!lyricsText) {
+            alert('❌ 请在文本框中粘贴歌词！');
+            btnAlign.disabled = false;
+            btnAlign.style.background = '#2196F3';
+            btnAlign.innerText = '🚀 一键 AI 强制对齐';
+            return;
+        }
+
+        const formData = new FormData();
+        formData.append('audio', audioFile);
+        formData.append('lyrics', lyricsText);
+        formData.append('ti', document.getElementById('ai-ti').value.trim());
+        formData.append('ar', document.getElementById('ai-ar').value.trim());
+        formData.append('al', document.getElementById('ai-al').value.trim());
+
+        try {
+            btnAlign.disabled = true;
+            btnAlign.style.background = '#9e9e9e';
+
+            btnAlign.innerText = '📡 正在寻找本地 AI 引擎...';
+            statusTxt.innerText = '正在扫描端口...';
+            const activePort = await findActiveBackendPort();
+
+            btnAlign.innerText = '⏳ AI 正在听歌... (约需几十秒)';
+            statusTxt.innerText = `已连接至端口 ${activePort}`;
+
+            if(audioBlobUrl) URL.revokeObjectURL(audioBlobUrl);
+            audioBlobUrl = URL.createObjectURL(audioFile);
+            ktvAudio.src = audioBlobUrl;
+
+            const response = await fetch(`http://127.0.0.1:${activePort}/api/align`, { method: 'POST', body: formData });
+            const resJson = await response.json();
+
+            if (resJson.code === 200) {
+                const lrcData = resJson.data;
+                cachedStandardLrc = typeof lrcData === 'string' ? lrcData : lrcData.standard_lrc;
+                cachedEnhancedLrc = typeof lrcData === 'string' ? lrcData : lrcData.enhanced_lrc;
+
+                applyLrcToEditor();
+                buildKtvStage();
+
+                if (currentMode === 'enhanced') {
+                    previewContainer.style.display = 'block';
+                }
+
+                setTimeout(() => {
+                    btnAlign.style.background = '#2196F3';
+                    btnAlign.innerText = '🚀 再次强制对齐';
+                    statusTxt.innerText = '生成完毕！可点击顶部 Tab 预览效果';
+                    btnAlign.disabled = false;
+                }, 2000);
+            } else {
+                throw new Error(resJson.message);
+            }
+        } catch (err) {
+            btnAlign.style.background = '#f44336';
+            btnAlign.innerText = '❌ 生成失败';
+            statusTxt.innerText = err.message;
+            setTimeout(() => {
+                btnAlign.style.background = '#2196F3';
+                btnAlign.innerText = '🚀 重新尝试';
+                btnAlign.disabled = false;
+            }, 3000);
+        }
+    });
+})();

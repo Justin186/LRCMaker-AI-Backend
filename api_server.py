@@ -26,7 +26,7 @@ model = None
 # ========== 可配置项 ==========
 # 模型规格：'tiny' / 'base' / 'small' / 'medium' / 'large-v3'
 # 越大越准但越慢/越占显存。GPU 上推荐 medium 或 large-v3
-MODEL_SIZE = "medium"
+MODEL_SIZE = "small"
 # 是否强制使用 GPU。True=优先 GPU(无则回退CPU)，False=强制 CPU
 FORCE_GPU = True
 # =============================
@@ -187,7 +187,7 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
         for w in current_line_words:
             clean_word = clean_str(w.word)
             if clean_word:
-                enhanced_line_str += f"<{format_time(w.start)}>{clean_word}"
+                enhanced_line_str += f"{clean_word}{format_time(w.end)}"
         enhanced_lrc_lines.append(enhanced_line_str)
 
         prev_line_end_time = current_line_end_time
