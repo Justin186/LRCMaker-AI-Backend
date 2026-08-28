@@ -11,6 +11,8 @@ import uvicorn
 import stable_whisper
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# 禁用 huggingface 的 xet 加速下载（在部分网络/Windows 环境下会报 401 错误）
+os.environ["HF_HUB_DISABLE_XET"] = "1"
 
 if getattr(sys, 'frozen', False):
     application_path = os.path.dirname(sys.executable)
@@ -21,6 +23,27 @@ else:
 
 model = None
 
+# ========== 可配置项 ==========
+# 模型规格：'tiny' / 'base' / 'small' / 'medium' / 'large-v3'
+# 越大越准但越慢/越占显存。GPU 上推荐 medium 或 large-v3
+MODEL_SIZE = "medium"
+# 是否强制使用 GPU。True=优先 GPU(无则回退CPU)，False=强制 CPU
+FORCE_GPU = True
+# =============================
+
+def pick_device():
+    """自动选择计算设备：优先 CUDA GPU，否则回退 CPU"""
+    try:
+        import torch
+        if FORCE_GPU and torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"🎮 检测到 NVIDIA GPU: {gpu_name}，使用 GPU 加速推理！")
+            return "cuda"
+    except Exception as e:
+        print(f"⚠️ 无法加载 torch 检测 GPU: {e}")
+    print("💻 未检测到可用 GPU，回退到 CPU 模式（速度较慢）。")
+    return "cpu"
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global model
@@ -29,19 +52,23 @@ async def lifespan(app: FastAPI):
     model_cache_dir = os.path.expanduser("~/.lrc_maker_models")
     os.makedirs(model_cache_dir, exist_ok=True)
     
-    local_model_path = os.path.join(application_path, "models", "faster-whisper-small")
+    # 优先使用本地离线模型目录（release 打包时内置）
+    local_model_path = os.path.join(application_path, "models", f"faster-whisper-{MODEL_SIZE}")
     
     if os.path.exists(local_model_path) and os.listdir(local_model_path):
         print(f"📦 发现本地离线模型目录，直接加载免下载：\n   -> {local_model_path}")
         model_target = local_model_path
     else:
-        print("🌐 未发现本地离线模型，将尝试从网络或系统缓存加载 'small' 模型...")
+        print(f"🌐 未发现本地离线模型，将尝试从网络或系统缓存加载 '{MODEL_SIZE}' 模型...")
         print(f"   (提示：你可以手动下载模型并放入 {local_model_path} 目录实现完全离线运行)")
-        model_target = 'small'
+        model_target = MODEL_SIZE
+    
+    device = pick_device()
     
     model = stable_whisper.load_faster_whisper(
         model_target, 
-        device="cpu", 
+        device=device, 
+        compute_type="float16" if device == "cuda" else "int8",
         download_root=model_cache_dir
     )
     
