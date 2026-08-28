@@ -4,6 +4,7 @@ import socket
 import tempfile
 import multiprocessing
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +30,8 @@ model = None
 MODEL_SIZE = "small"
 # 是否强制使用 GPU。True=优先 GPU(无则回退CPU)，False=强制 CPU
 FORCE_GPU = True
+# 词间停顿判定阈值（秒）：相邻两词间隔超过该值，视为句中停顿
+GAP_THRESHOLD = 0.001
 # =============================
 
 def pick_device():
@@ -92,7 +95,7 @@ def format_time(seconds):
     return f"[{minutes:02d}:{remaining_seconds:05.2f}]"
 
 def clean_str(s):
-    return s.replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
+    return s.replace(" ", "").replace("\u3000", "").replace("\n", "").replace("\r", "").replace("\t", "")
 
 def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str, al: str) -> dict:
     raw_lines = raw_lyrics_text.splitlines()
@@ -168,26 +171,58 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
             lrc_lines.append(interlude_str)
             enhanced_lrc_lines.append(interlude_str)
 
-        target_len = len(clean_str(line))
-        current_len = 0
+        target = clean_str(line)
+        target_len = len(target)
         current_line_end_time = start_time
         
         current_line_words = []
+        current_text = ""
 
-        while word_idx < total_words and current_len < target_len:
+        while word_idx < total_words and len(current_text) < target_len:
             current_word = all_words[word_idx]
-            current_line_words.append(current_word)
-            current_len += len(clean_str(current_word.word))
-            current_line_end_time = current_word.end
-            word_idx += 1
+            word_text = clean_str(current_word.word)
+            if not word_text:
+                word_idx += 1
+                continue
+
+            new_text = current_text + word_text
+            if target.startswith(new_text):
+                # 整个词都在当前行内
+                current_line_words.append(current_word)
+                current_text = new_text
+                current_line_end_time = current_word.end
+                word_idx += 1
+            else:
+                # 词跨越行边界：当前行取需要的部分，剩余留给下一行
+                remaining = target_len - len(current_text)
+                if remaining > 0:
+                    head_text = word_text[:remaining]
+                    tail_text = word_text[remaining:]
+                    ratio = remaining / len(word_text)
+                    head_end = current_word.start + (current_word.end - current_word.start) * ratio
+                    head_word = SimpleNamespace(word=head_text, start=current_word.start, end=head_end)
+                    current_line_words.append(head_word)
+                    current_text = current_text + head_text
+                    current_line_end_time = head_end
+                    if tail_text:
+                        tail_word = SimpleNamespace(word=tail_text, start=head_end, end=current_word.end)
+                        all_words[word_idx] = tail_word
+                    else:
+                        word_idx += 1
+                break
 
         lrc_lines.append(f"{start_time_str}{line}")
         
+        valid_words = [w for w in current_line_words if clean_str(w.word)]
         enhanced_line_str = f"{start_time_str}"
-        for w in current_line_words:
+        for i, w in enumerate(valid_words):
             clean_word = clean_str(w.word)
-            if clean_word:
-                enhanced_line_str += f"{clean_word}{format_time(w.end)}"
+            enhanced_line_str += f"{clean_word}{format_time(w.end)}"
+            # 若下一词起始与当前词结束不一致（句中停顿），额外标记下一词起始时间
+            if i < len(valid_words) - 1:
+                next_w = valid_words[i + 1]
+                if next_w.start - w.end > GAP_THRESHOLD:
+                    enhanced_line_str += format_time(next_w.start)
         enhanced_lrc_lines.append(enhanced_line_str)
 
         prev_line_end_time = current_line_end_time

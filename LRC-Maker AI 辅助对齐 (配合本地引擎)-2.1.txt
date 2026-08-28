@@ -188,15 +188,18 @@
 
     function parseEnhancedLrc(lrc) {
         const lines = [];
-        // ESLRC 风格：行首 [mm:ss.xx] 为行起始时间，每个词后跟 [mm:ss.xx] 为该词结束时间
-        // 例：[00:12.34]我[00:13.00]爱[00:13.50]你[00:14.20]
+        // ESLRC 风格：行首 [mm:ss.xx] 为行起始时间
+        // 每个词后跟 [mm:ss.xx] 为该词结束时间；若词间有停顿，则额外跟一个 [mm:ss.xx] 为下一词开始时间
+        // 例（无停顿）：[00:12.34]我[00:13.00]爱[00:13.50]你[00:14.20]
+        // 例（词2后有停顿）：[00:12.34]我[00:13.00]爱[00:13.50][00:15.00]你[00:15.80]
         const lineStartReg = /^\[(\d{2}):(\d{2}\.\d{2})\]/;
-        const wordReg = /([^\[\]]+)\[(\d{2}):(\d{2}\.\d{2})\]/g;
+        const wordReg = /([^\[\]]+)((?:\[\d{2}:\d{2}\.\d{2}\])+)/g;
+        const timeReg = /\[(\d{2}):(\d{2}\.\d{2})\]/g;
 
         lrc.split('\n').forEach(lineStr => {
             const line = { words: [] };
             const lineStartMatch = lineStartReg.exec(lineStr);
-            const lineStart = lineStartMatch
+            let nextStart = lineStartMatch
                 ? parseInt(lineStartMatch[1]) * 60 + parseFloat(lineStartMatch[2])
                 : null;
 
@@ -204,13 +207,21 @@
             wordReg.lastIndex = 0;
             while ((match = wordReg.exec(lineStr)) !== null) {
                 const text = match[1].trim();
-                const end = parseInt(match[2]) * 60 + parseFloat(match[3]);
-                if (text) {
-                    const start = line.words.length > 0
-                        ? line.words[line.words.length - 1].end
-                        : (lineStart !== null ? lineStart : end);
-                    line.words.push({ start: start, text: text, end: end });
+                if (!text) continue;
+
+                const stamps = [];
+                let tm;
+                timeReg.lastIndex = 0;
+                while ((tm = timeReg.exec(match[2])) !== null) {
+                    stamps.push(parseInt(tm[1]) * 60 + parseFloat(tm[2]));
                 }
+
+                const end = stamps[0];
+                const start = nextStart !== null ? nextStart : end;
+                line.words.push({ start: start, text: text, end: end });
+
+                // 有第二个时间戳说明词间有停顿，下一词从该时间戳开始；否则无缝衔接
+                nextStart = stamps.length > 1 ? stamps[1] : end;
             }
             if (line.words.length > 0) lines.push(line);
         });
