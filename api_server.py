@@ -226,19 +226,37 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
 
         print(f"🧠 检测到 {len(segments)} 个歌词段落，进行分段强制对齐...")
         audio = load_audio(audio_path)  # 16kHz numpy 数组
+        audio_duration = audio.shape[0] / 16000.0
+
+        # ===== 参考时间戳保护：若参考时间远超音频实际长度，按比例缩放 =====
+        # 网易云标准 LRC 时间可能比实际发音晚很多，甚至超过音频末尾。
+        # 若不缩放，切片会超出音频范围，导致对齐结果全部堆叠在同一时间点。
+        if ref_times[-1] > audio_duration:
+            scale = audio_duration / ref_times[-1]
+            print(f"⚠️ 参考时间戳末尾 {ref_times[-1]:.2f}s 超过音频实际长度 {audio_duration:.2f}s，"
+                  f"按比例缩放 ref_times (×{scale:.3f})")
+            ref_times = [t * scale for t in ref_times]
 
         for (s, e) in segments:
             seg_text = "\n".join(sung_lines[s:e+1])
             # 音频切片前后各留余量，避免参考时间戳偏差导致歌词被截断
             PAD_BEFORE = 1.0  # 段前余量（秒）
-            PAD_AFTER = 2.0   # 段后余量（秒）
+            PAD_AFTER = 3.0   # 段后余量（秒）
             start_t = max(0.0, ref_times[s] - PAD_BEFORE)
+            # 段末余量：网易云参考时间可能比实际发音早，若只按下一段参考时间切，
+            # 会截断当前段最后一行（"Failed to align the last N words"）。
+            # 因此段末至少留 ref_times[e] + 5s 的余量，再与下一段参考时间取较大值。
+            seg_tail_min = ref_times[e] + 5.0 + PAD_AFTER
             if e + 1 < len(sung_lines):
-                end_t = ref_times[e+1] + PAD_AFTER
+                end_t = max(ref_times[e+1] + PAD_AFTER, seg_tail_min)
             else:
-                end_t = ref_times[e] + 5.0 + PAD_AFTER
+                end_t = seg_tail_min
             start_sample = int(start_t * 16000)
-            end_sample = int(end_t * 16000)
+            # 限制切片不超出音频末尾，避免空切片/越界导致对齐错乱
+            end_sample = min(int(end_t * 16000), audio.shape[0])
+            if end_sample <= start_sample:
+                print(f"  ⚠️ 段落 {s+1}-{e+1} 切片为空，跳过")
+                continue
             seg_audio = audio[start_sample:end_sample]
 
             print(f"  📄 段落 {s+1}-{e+1}: [{start_t:.2f}s - {end_t:.2f}s]")
