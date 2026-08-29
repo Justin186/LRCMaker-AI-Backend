@@ -126,6 +126,36 @@ def log_request(audio_name: str, source_text: str, result: dict):
 def clean_str(s):
     return s.replace(" ", "").replace("\u3000", "").replace("\n", "").replace("\r", "").replace("\t", "")
 
+def detect_language(text: str) -> str:
+    """根据歌词内容自动判断语言，返回 faster-whisper 支持的语言代码"""
+    import re
+    # 统计各类字符数量
+    han_count = len(re.findall(r'[\u4e00-\u9fff]', text))          # 简体中文
+    hant_count = len(re.findall(r'[\u3400-\u4dbf]', text))          # 扩展区汉字
+    kana_count = len(re.findall(r'[\u3040-\u30ff]', text))          # 日文假名
+    hangul_count = len(re.findall(r'[\uac00-\ud7af]', text))        # 韩文
+    latin_count = len(re.findall(r'[A-Za-z]', text))                # 拉丁字母（英/法/德等）
+    cyrillic_count = len(re.findall(r'[\u0400-\u04ff]', text))      # 西里尔字母（俄语等）
+    thai_count = len(re.findall(r'[\u0e00-\u0e7f]', text))          # 泰文
+
+    # 按字符数占比判断
+    total = max(1, han_count + hant_count + kana_count + hangul_count + latin_count + cyrillic_count + thai_count)
+
+    if kana_count / total > 0.3:
+        return 'ja'
+    if hangul_count / total > 0.3:
+        return 'ko'
+    if (han_count + hant_count) / total > 0.3:
+        return 'zh'
+    if cyrillic_count / total > 0.3:
+        return 'ru'
+    if thai_count / total > 0.3:
+        return 'th'
+    if latin_count / total > 0.3:
+        return 'en'
+    # 默认回退中文
+    return 'zh'
+
 def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str, al: str) -> dict:
     raw_lines = raw_lyrics_text.splitlines()
     staff_lines = []
@@ -155,8 +185,10 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
         return {"error": "❌ 错误：未在文本中找到有效歌词，请检查排版。"}
 
     full_text = "\n".join(sung_lines)
+    lang = detect_language(full_text)
+    print(f"🌐 检测到歌词语言: {lang}")
     print("🧠 正在进行强制对齐推理...")
-    result = model.align(audio_path, full_text, language='zh')
+    result = model.align(audio_path, full_text, language=lang)
 
     all_words = []
     for seg in result.segments:
