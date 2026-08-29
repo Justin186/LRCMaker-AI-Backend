@@ -2,6 +2,7 @@ import os
 import sys
 import socket
 import tempfile
+import datetime
 import multiprocessing
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -32,6 +33,8 @@ MODEL_SIZE = "small"
 FORCE_GPU = True
 # 词间停顿判定阈值（秒）：相邻两词间隔超过该值，视为句中停顿
 GAP_THRESHOLD = 0.001
+# 是否记录请求日志（源文本 + 输出 LRC 写入 logs/align_requests.log）。True=记录，False=不记录
+ENABLE_REQUEST_LOG = True
 # =============================
 
 def pick_device():
@@ -93,6 +96,32 @@ def format_time(seconds):
     minutes = int(seconds // 60)
     remaining_seconds = seconds % 60
     return f"[{minutes:02d}:{remaining_seconds:05.2f}]"
+
+def log_request(audio_name: str, source_text: str, result: dict):
+    """将每次对齐请求的源文本与输出 LRC 写入日志文件"""
+    if not ENABLE_REQUEST_LOG:
+        return
+    try:
+        log_dir = os.path.join(application_path, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "align_requests.log")
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("=" * 60 + "\n")
+            f.write(f"[{timestamp}] 音频文件: {audio_name}\n")
+            f.write("-" * 60 + "\n")
+            f.write("[源文本]\n")
+            f.write(source_text + "\n")
+            f.write("-" * 60 + "\n")
+            f.write("[标准 LRC]\n")
+            f.write(result.get("standard_lrc", "") + "\n")
+            f.write("-" * 60 + "\n")
+            f.write("[逐字 LRC]\n")
+            f.write(result.get("enhanced_lrc", "") + "\n")
+            f.write("=" * 60 + "\n\n")
+        print(f"📝 请求日志已写入: {log_path}")
+    except Exception as e:
+        print(f"⚠️ 写入请求日志失败: {e}")
 
 def clean_str(s):
     return s.replace(" ", "").replace("\u3000", "").replace("\n", "").replace("\r", "").replace("\t", "")
@@ -266,6 +295,8 @@ async def api_align(
             print(lrc_result_dict["error"])
             return {"code": 400, "message": lrc_result_dict["error"], "data": None}
             
+        log_request(audio.filename, lyrics, lrc_result_dict)
+        
         print("✅ 处理完成，返回标准与逐字双轨数据给前端。")
         return {"code": 200, "message": "success", "data": lrc_result_dict}
         
