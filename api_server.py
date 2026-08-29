@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import socket
 import tempfile
 import datetime
@@ -11,6 +12,7 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import stable_whisper
+from stable_whisper.audio import load_audio
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 # 禁用 huggingface 的 xet 加速下载（在部分网络/Windows 环境下会报 401 错误）
@@ -34,7 +36,7 @@ FORCE_GPU = True
 # 词间停顿判定阈值（秒）：相邻两词间隔超过该值，视为句中停顿
 GAP_THRESHOLD = 0.001
 # 是否记录请求日志（源文本 + 输出 LRC 写入 logs/align_requests.log）。True=记录，False=不记录
-ENABLE_REQUEST_LOG = True
+ENABLE_REQUEST_LOG = False
 # =============================
 
 def pick_device():
@@ -156,14 +158,15 @@ def detect_language(text: str) -> str:
     # 默认回退中文
     return 'zh'
 
-def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str, al: str) -> dict:
+def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str, al: str, times=None) -> dict:
     raw_lines = raw_lyrics_text.splitlines()
     staff_lines = []
     sung_lines = []
+    sung_indices = []  # sung_lines 每行在 raw_lines 中的索引
     has_separator = any(line.strip() == "---" for line in raw_lines)
     is_sung_started = False
     
-    for line in raw_lines:
+    for idx, line in enumerate(raw_lines):
         line = line.strip()
         if not line: continue
         if has_separator:
@@ -174,12 +177,14 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                 staff_lines.append(line)
             else:
                 sung_lines.append(line)
+                sung_indices.append(idx)
         else:
             if not is_sung_started and (":" in line or "：" in line):
                 staff_lines.append(line)
             else:
                 is_sung_started = True
                 sung_lines.append(line)
+                sung_indices.append(idx)
                 
     if not sung_lines:
         return {"error": "❌ 错误：未在文本中找到有效歌词，请检查排版。"}
@@ -187,13 +192,72 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
     full_text = "\n".join(sung_lines)
     lang = detect_language(full_text)
     print(f"🌐 检测到歌词语言: {lang}")
-    print("🧠 正在进行强制对齐推理...")
-    result = model.align(audio_path, full_text, language=lang)
+
+    # 解析参考时间戳（秒），对应 sung_lines 每行
+    ref_times = None
+    if times and len(times) == len(raw_lines):
+        ref_times = [times[i] for i in sung_indices]
 
     all_words = []
-    for seg in result.segments:
-        for w in seg.words:
-            all_words.append(w)
+
+    # 参考时间戳有效：长度匹配且存在非零时间（避免无时间戳歌词误入分段逻辑）
+    has_valid_times = ref_times and len(ref_times) == len(sung_lines) and max(ref_times) > 0
+
+    if has_valid_times:
+        # ===== 分段对齐：根据参考时间戳把歌词分段，避免长间奏导致的对齐漂移 =====
+        SEGMENT_GAP = 10.0  # 相邻行时间差超过该值视为间奏断点（秒）
+        segments = []      # 每段是 (start_idx, end_idx) 闭区间
+        seg_start = 0
+        for i in range(1, len(sung_lines)):
+            if ref_times[i] - ref_times[i-1] > SEGMENT_GAP:
+                segments.append((seg_start, i-1))
+                seg_start = i
+        segments.append((seg_start, len(sung_lines)-1))
+
+        # 合并单行段落：单行歌词对齐效果差，合并到前一段
+        merged = []
+        for (s, e) in segments:
+            if merged and (e - s + 1) == 1:
+                prev_s, prev_e = merged[-1]
+                merged[-1] = (prev_s, e)
+            else:
+                merged.append((s, e))
+        segments = merged
+
+        print(f"🧠 检测到 {len(segments)} 个歌词段落，进行分段强制对齐...")
+        audio = load_audio(audio_path)  # 16kHz numpy 数组
+
+        for (s, e) in segments:
+            seg_text = "\n".join(sung_lines[s:e+1])
+            # 音频切片前后各留余量，避免参考时间戳偏差导致歌词被截断
+            PAD_BEFORE = 1.0  # 段前余量（秒）
+            PAD_AFTER = 2.0   # 段后余量（秒）
+            start_t = max(0.0, ref_times[s] - PAD_BEFORE)
+            if e + 1 < len(sung_lines):
+                end_t = ref_times[e+1] + PAD_AFTER
+            else:
+                end_t = ref_times[e] + 5.0 + PAD_AFTER
+            start_sample = int(start_t * 16000)
+            end_sample = int(end_t * 16000)
+            seg_audio = audio[start_sample:end_sample]
+
+            print(f"  📄 段落 {s+1}-{e+1}: [{start_t:.2f}s - {end_t:.2f}s]")
+            seg_result = model.align(seg_audio, seg_text, language=lang)
+            if seg_result is None:
+                continue
+            for seg in seg_result.segments:
+                for w in seg.words:
+                    # 时间戳加上段起始偏移（align 返回相对切片开头的时间）
+                    w.start += start_t
+                    w.end += start_t
+                    all_words.append(w)
+    else:
+        # ===== 无参考时间戳，整段对齐 =====
+        print("🧠 正在进行强制对齐推理...")
+        result = model.align(audio_path, full_text, language=lang)
+        for seg in result.segments:
+            for w in seg.words:
+                all_words.append(w)
 
     lrc_lines = []
     enhanced_lrc_lines = []
@@ -308,7 +372,8 @@ async def api_align(
     lyrics: str = Form(...),
     ti: str = Form(""),
     ar: str = Form(""),
-    al: str = Form("")
+    al: str = Form(""),
+    times: str = Form("")
 ):
     print(f"📥 收到请求：音频文件 [{audio.filename}], 文本长度 [{len(lyrics)}]")
     
@@ -321,7 +386,14 @@ async def api_align(
             
         print("🎵 音频已保存至临时目录，开始处理...")
         
-        lrc_result_dict = generate_lrc_content(tmp_path, lyrics, ti, ar, al)
+        # 解析参考时间戳（可选，JSON 数组，秒）
+        ref_times = None
+        if times:
+            try:
+                ref_times = json.loads(times)
+            except Exception:
+                ref_times = None
+        lrc_result_dict = generate_lrc_content(tmp_path, lyrics, ti, ar, al, times=ref_times)
         
         if isinstance(lrc_result_dict, dict) and "error" in lrc_result_dict:
             print(lrc_result_dict["error"])
