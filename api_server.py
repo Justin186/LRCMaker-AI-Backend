@@ -428,7 +428,21 @@ async def api_align(
         
     finally:
         if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+            # Windows 下音频解码库（soundfile 等）可能未及时释放文件句柄，
+            # 直接删除会报 PermissionError: [WinError 32]。这里带重试地删除，
+            # 多次失败则忽略（临时文件最终会被系统自动清理）。
+            for _ in range(5):
+                try:
+                    os.unlink(tmp_path)
+                    break
+                except PermissionError:
+                    import time
+                    time.sleep(0.2)
+                except FileNotFoundError:
+                    break
+                except Exception as e:
+                    print(f"⚠️ 删除临时文件失败（将忽略）: {e}")
+                    break
 
 def find_free_port(start_port=8000):
     """从指定的起始端口开始，寻找一个未被占用的本地端口"""
