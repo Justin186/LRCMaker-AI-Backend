@@ -36,7 +36,9 @@ FORCE_GPU = True
 # 词间停顿判定阈值（秒）：相邻两词间隔超过该值，视为句中停顿
 GAP_THRESHOLD = 0.001
 # 是否记录请求日志（源文本 + 输出 LRC 写入 logs/align_requests.log）。True=记录，False=不记录
-ENABLE_REQUEST_LOG = False
+ENABLE_REQUEST_LOG = True
+# 是否把上传的音频保存到项目 audio/ 目录（方便试听/调试）。True=保存，False=不保存
+SAVE_AUDIO = True
 # =============================
 
 def pick_device():
@@ -115,6 +117,12 @@ def log_request(audio_name: str, source_text: str, result: dict):
             f.write("[源文本]\n")
             f.write(source_text + "\n")
             f.write("-" * 60 + "\n")
+            # 原始传入数据调试信息（每行歌词 + 参考时间戳），便于排查对齐问题
+            debug_info = result.get("debug_info", "")
+            if debug_info:
+                f.write("[原始传入数据]\n")
+                f.write(debug_info + "\n")
+                f.write("-" * 60 + "\n")
             f.write("[标准 LRC]\n")
             f.write(result.get("standard_lrc", "") + "\n")
             f.write("-" * 60 + "\n")
@@ -127,6 +135,34 @@ def log_request(audio_name: str, source_text: str, result: dict):
 
 def clean_str(s):
     return s.replace(" ", "").replace("\u3000", "").replace("\n", "").replace("\r", "").replace("\t", "")
+
+def detect_audio_ext(content: bytes) -> str:
+    """根据文件头（magic bytes）识别音频格式，返回带点的扩展名（如 '.mp3'）。
+    无法识别时返回 None。"""
+    if not content:
+        return None
+    # MP3: ID3 标签开头，或 0xFF 0xFB/0xF3/0xF2 等帧同步
+    if content[:3] == b'ID3' or (content[0] == 0xFF and (content[1] & 0xE0) == 0xE0):
+        return '.mp3'
+    # WAV/RIFF
+    if content[:4] == b'RIFF' and content[8:12] == b'WAVE':
+        return '.wav'
+    # FLAC
+    if content[:4] == b'fLaC':
+        return '.flac'
+    # OGG
+    if content[:4] == b'OggS':
+        return '.ogg'
+    # M4A/MP4 (ftyp)
+    if content[4:8] == b'ftyp':
+        return '.m4a'
+    # AAC (ADTS)
+    if content[0] == 0xFF and (content[1] & 0xF6) == 0xF0:
+        return '.aac'
+    # WMA (ASF)
+    if content[:16] == b'\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c':
+        return '.wma'
+    return None
 
 def detect_language(text: str) -> str:
     """根据歌词内容自动判断语言，返回 faster-whisper 支持的语言代码"""
@@ -198,77 +234,268 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
     if times and len(times) == len(raw_lines):
         ref_times = [times[i] for i in sung_indices]
 
+    # ===== 收集原始传入数据的调试信息（写入请求日志，便于排查对齐问题） =====
+    debug_info = []
+    debug_info.append(f"原始文本行数: {len(raw_lines)}")
+    debug_info.append(f"演唱歌词行数: {len(sung_lines)}")
+    debug_info.append(f"参考时间戳数量: {len(ref_times) if ref_times else 0}")
+    debug_info.append("-" * 60)
+    for idx, line in enumerate(sung_lines):
+        t = f"{ref_times[idx]:8.2f}s" if ref_times and idx < len(ref_times) else "  无时间  "
+        debug_info.append(f"  [{idx:3d}] {t} | {line}")
+    debug_info_str = "\n".join(debug_info)
+
     all_words = []
+
+    def fix_stacked_timestamps(words):
+        """
+        检测并修复因对齐失败导致的时间戳堆叠问题。
+
+        当 stable_whisper 对齐失败时，失败的词会被赋予相同的时间戳（通常是段尾时间），
+        导致大量词堆积在同一时间点。此函数检测连续多个词时间戳完全相同的"卡住"区域，
+        并通过线性插值修复，最后做单调递增校正保证时间戳不倒退。
+        """
+        if len(words) < 2:
+            return words
+
+        fixed = [SimpleNamespace(word=w.word, start=w.start, end=w.end) for w in words]
+        n = len(fixed)
+
+        # 检测"卡住"区域：连续多个词挤在极短的时间跨度内（间隔极小）。
+        # 对齐失败时，stable_whisper 可能给所有词相同时间戳，也可能给间隔极小（0.01s）
+        # 的时间戳。因此用"时间跨度"而非"完全相同"来检测，更稳健。
+        MIN_STUCK_RUN = 15   # 至少连续15个词挤在一起才视为卡住（正常歌词一行最多10-15字）
+        STUCK_SPAN = 0.5     # 挤在一起的时间跨度阈值（秒）
+
+        i = 0
+        while i < n:
+            # 从 i 开始，找到连续挤在一起的区域（时间跨度 < STUCK_SPAN）
+            j = i + 1
+            while j < n and (fixed[j].start - fixed[i].start) < STUCK_SPAN:
+                j += 1
+
+            run_len = j - i
+            if run_len >= MIN_STUCK_RUN:
+                # 找到卡住区域，进行插值修复
+                # 前边界：卡住区域前最后一个词的 end 时间
+                prev_end = fixed[i - 1].end if i > 0 else 0.0
+
+                # 后边界：卡住区域后第一个词的 start 时间
+                next_start = fixed[j].start if j < n else None
+
+                # 确定插值终点：优先用后一个正常词的 start，否则向后展开
+                if next_start is not None and next_start > prev_end:
+                    end_t = next_start
+                else:
+                    # 卡住区域在末尾，或后边界不合法：向后展开，每词至少 0.3s
+                    end_t = prev_end + max(run_len * 0.3, 1.0)
+
+                total_time = end_t - prev_end
+                step = total_time / (run_len + 1)
+
+                for k in range(run_len):
+                    fixed[i + k].start = prev_end + step * (k + 1)
+                    fixed[i + k].end = prev_end + step * (k + 1) + step * 0.8
+
+                i = j
+            else:
+                i += 1
+
+        # ===== 单调递增校正：确保整个序列时间戳不倒退 =====
+        # 插值可能产生时间倒退（卡住区域前有正常词，但插值起点早于这些词），
+        # 这里把每个词的 start 推到前一个词的 end 之后，保证时间单调递增。
+        for k in range(1, n):
+            if fixed[k].start < fixed[k - 1].end:
+                fixed[k].start = fixed[k - 1].end
+                fixed[k].end = max(fixed[k].end, fixed[k].start + 0.01)
+
+        return fixed
 
     # 参考时间戳有效：长度匹配且存在非零时间（避免无时间戳歌词误入分段逻辑）
     has_valid_times = ref_times and len(ref_times) == len(sung_lines) and max(ref_times) > 0
 
     if has_valid_times:
-        # ===== 分段对齐：根据参考时间戳把歌词分段，避免长间奏导致的对齐漂移 =====
+        # ===== 参考时间戳可靠性检测：检测"堆叠"区域 =====
+        # 网易云标准 LRC 时间戳在歌曲后半部分可能完全失效：大量连续行被错误地
+        # 堆叠在同一个时间点（间隔仅 0.01-0.1s）。此时参考时间戳已不可靠，需要改用
+        # "切片 + 整段对齐"（让模型自己在切片范围内识别歌词时间）。
+        # 注意：这里不做"跳跃校正"（把大间隔误判为异常跳跃并前移时间戳），因为
+        # 大间隔往往是真实的间奏（如副歌之间的间奏），前移会破坏正常的时间戳，
+        # 导致切片范围错误、段末歌词对齐失败。
         SEGMENT_GAP = 10.0  # 相邻行时间差超过该值视为间奏断点（秒）
-        segments = []      # 每段是 (start_idx, end_idx) 闭区间
-        seg_start = 0
-        for i in range(1, len(sung_lines)):
-            if ref_times[i] - ref_times[i-1] > SEGMENT_GAP:
-                segments.append((seg_start, i-1))
-                seg_start = i
-        segments.append((seg_start, len(sung_lines)-1))
+        STACK_RUN = 5      # 连续至少 5 行挤在一起视为堆叠
+        STACK_SPAN = 2.0   # 挤在一起的时间跨度阈值（秒）
+        stack_start = None
+        i = 0
+        while i < len(ref_times):
+            j = i + 1
+            while j < len(ref_times) and (ref_times[j] - ref_times[i]) < STACK_SPAN:
+                j += 1
+            if (j - i) >= STACK_RUN:
+                stack_start = i
+                break
+            i += 1
 
-        # 合并单行段落：单行歌词对齐效果差，合并到前一段
-        merged = []
-        for (s, e) in segments:
-            if merged and (e - s + 1) == 1:
-                prev_s, prev_e = merged[-1]
-                merged[-1] = (prev_s, e)
+        if stack_start is not None:
+            print(f"⚠️ 参考时间戳在第 {stack_start} 行之后出现堆叠（{j-i} 行挤在 "
+                  f"{ref_times[j-1]-ref_times[i]:.2f}s 内），参考时间戳后半部分不可靠！")
+            # 后半部分包含堆叠前 2 行作为锚点，帮助模型定位切片起始位置
+            ANCHOR_LINES = 2
+            anchor_start = max(0, stack_start - ANCHOR_LINES)
+            print(f"🔄 改用「切片 + 整段对齐」策略：前半(1-{anchor_start}行)用参考时间戳，"
+                  f"后半({anchor_start+1}-{len(sung_lines)}行，含{ANCHOR_LINES}行锚点)让模型自行识别。")
+            # ===== 方案：前半用参考时间戳分段对齐，后半用切片 + 整段对齐 =====
+            audio = load_audio(audio_path)
+            audio_duration = audio.shape[0] / 16000.0
+
+            # 前半部分：堆叠区域之前的歌词（索引 0 到 anchor_start-1）
+            # 用参考时间戳分段对齐（与现有逻辑相同）
+            if anchor_start > 0:
+                front_segments = []
+                seg_start = 0
+                for k in range(1, anchor_start):
+                    if ref_times[k] - ref_times[k-1] > SEGMENT_GAP:
+                        front_segments.append((seg_start, k-1))
+                        seg_start = k
+                front_segments.append((seg_start, anchor_start-1))
+                # 合并单行段落
+                merged = []
+                for (s, e) in front_segments:
+                    if merged and (e - s + 1) == 1:
+                        prev_s, prev_e = merged[-1]
+                        merged[-1] = (prev_s, e)
+                    else:
+                        merged.append((s, e))
+                front_segments = merged
+
+                print(f"🧠 前半部分（第 1-{anchor_start} 行）用参考时间戳分段对齐，共 {len(front_segments)} 段...")
+                for (s, e) in front_segments:
+                    seg_text = "\n".join(sung_lines[s:e+1])
+                    PAD_BEFORE = 1.0
+                    PAD_AFTER = 5.0
+                    start_t = max(0.0, ref_times[s] - PAD_BEFORE)
+                    seg_tail_min = ref_times[e] + 5.0 + PAD_AFTER
+                    if e + 1 < anchor_start:
+                        end_t = max(ref_times[e+1] + PAD_AFTER, seg_tail_min)
+                    else:
+                        # 前半最后一段：延伸到锚点区域起点 + 余量
+                        end_t = max(ref_times[anchor_start] + PAD_AFTER, seg_tail_min)
+                    start_sample = int(start_t * 16000)
+                    end_sample = min(int(end_t * 16000), audio.shape[0])
+                    if end_sample <= start_sample:
+                        continue
+                    seg_audio = audio[start_sample:end_sample]
+                    print(f"  📄 段落 {s+1}-{e+1}: [{start_t:.2f}s - {end_t:.2f}s]")
+                    seg_result = model.align(seg_audio, seg_text, language=lang)
+                    if seg_result is None:
+                        continue
+                    for seg in seg_result.segments:
+                        for w in seg.words:
+                            w.start += start_t
+                            w.end += start_t
+                            all_words.append(w)
+
+            # 后半部分：堆叠区域及之后的歌词
+            # 关键：包含堆叠前 2 行作为锚点（锚点歌词时间戳可靠，帮助模型定位切片起始位置）
+            ANCHOR_LINES = 2
+            anchor_start = max(0, stack_start - ANCHOR_LINES)
+            tail_text = "\n".join(sung_lines[anchor_start:])
+            # 切片起点：锚点行的参考时间 - 余量
+            if anchor_start > 0:
+                tail_start = max(0.0, ref_times[anchor_start-1] - 2.0)
             else:
-                merged.append((s, e))
-        segments = merged
+                tail_start = 0.0
+            tail_end = audio_duration
+            tail_audio = audio[int(tail_start*16000):int(tail_end*16000)]
+            print(f"🧠 后半部分（第 {anchor_start+1}-{len(sung_lines)} 行，含 {ANCHOR_LINES} 行锚点）"
+                  f"用切片 + 整段对齐，切片 [{tail_start:.2f}s - {tail_end:.2f}s]...")
+            tail_result = model.align(tail_audio, tail_text, language=lang)
+            if tail_result is not None:
+                for seg in tail_result.segments:
+                    for w in seg.words:
+                        w.start += tail_start
+                        w.end += tail_start
+                        all_words.append(w)
 
-        print(f"🧠 检测到 {len(segments)} 个歌词段落，进行分段强制对齐...")
-        audio = load_audio(audio_path)  # 16kHz numpy 数组
-        audio_duration = audio.shape[0] / 16000.0
+            # ===== 修复时间戳堆叠：对齐失败的词会被赋予相同时间戳，需要插值修复 =====
+            all_words = fix_stacked_timestamps(all_words)
+        else:
+            # ===== 参考时间戳可靠，用"最大间奏断点 2 段方案"对齐 =====
+            # 实测发现：把歌词切成很多小段（每段切片精确到下一段参考时间）时，
+            # 中间段落（尤其 15+ 行的大段）段末歌词会对齐失败并堆叠
+            # （"Failed to align the last N words"），因为切片边界截断了段末歌词。
+            # 更稳健的方案：找参考时间戳的最大间奏间隔作为断点，把歌词分成 2 段：
+            #   段1: 断点前歌词，切片精确（0 到断点前参考时间）
+            #   段2: 断点后歌词，切片延伸到音频末尾（模型有足够范围识别所有歌词）
+            # 实测该方案所有行时间戳都正确展开（误差 < 1s）。
+            audio = load_audio(audio_path)  # 16kHz numpy 数组
+            audio_duration = audio.shape[0] / 16000.0
 
-        # ===== 参考时间戳保护：若参考时间远超音频实际长度，按比例缩放 =====
-        # 网易云标准 LRC 时间可能比实际发音晚很多，甚至超过音频末尾。
-        # 若不缩放，切片会超出音频范围，导致对齐结果全部堆叠在同一时间点。
-        if ref_times[-1] > audio_duration:
-            scale = audio_duration / ref_times[-1]
-            print(f"⚠️ 参考时间戳末尾 {ref_times[-1]:.2f}s 超过音频实际长度 {audio_duration:.2f}s，"
-                  f"按比例缩放 ref_times (×{scale:.3f})")
-            ref_times = [t * scale for t in ref_times]
+            # ===== 参考时间戳保护：若参考时间远超音频实际长度，按比例缩放 =====
+            # 网易云标准 LRC 时间可能比实际发音晚很多，甚至超过音频末尾。
+            # 若不缩放，切片会超出音频范围，导致对齐结果全部堆叠在同一时间点。
+            if ref_times[-1] > audio_duration:
+                scale = audio_duration / ref_times[-1]
+                print(f"⚠️ 参考时间戳末尾 {ref_times[-1]:.2f}s 超过音频实际长度 {audio_duration:.2f}s，"
+                      f"按比例缩放 ref_times (×{scale:.3f})")
+                ref_times = [t * scale for t in ref_times]
 
-        for (s, e) in segments:
-            seg_text = "\n".join(sung_lines[s:e+1])
-            # 音频切片前后各留余量，避免参考时间戳偏差导致歌词被截断
-            PAD_BEFORE = 1.0  # 段前余量（秒）
-            PAD_AFTER = 3.0   # 段后余量（秒）
-            start_t = max(0.0, ref_times[s] - PAD_BEFORE)
-            # 段末余量：网易云参考时间可能比实际发音早，若只按下一段参考时间切，
-            # 会截断当前段最后一行（"Failed to align the last N words"）。
-            # 因此段末至少留 ref_times[e] + 5s 的余量，再与下一段参考时间取较大值。
-            seg_tail_min = ref_times[e] + 5.0 + PAD_AFTER
-            if e + 1 < len(sung_lines):
-                end_t = max(ref_times[e+1] + PAD_AFTER, seg_tail_min)
-            else:
-                end_t = seg_tail_min
-            start_sample = int(start_t * 16000)
-            # 限制切片不超出音频末尾，避免空切片/越界导致对齐错乱
-            end_sample = min(int(end_t * 16000), audio.shape[0])
-            if end_sample <= start_sample:
-                print(f"  ⚠️ 段落 {s+1}-{e+1} 切片为空，跳过")
-                continue
-            seg_audio = audio[start_sample:end_sample]
+            # 找最大间奏间隔作为断点
+            max_gap = 0
+            break_idx = -1
+            for i in range(1, len(ref_times)):
+                gap = ref_times[i] - ref_times[i-1]
+                if gap > max_gap:
+                    max_gap = gap
+                    break_idx = i  # 断点在第 i 行之前
+            print(f"🧠 最大间奏间隔 {max_gap:.2f}s，断点在第 {break_idx} 行之前，"
+                  f"用 2 段方案对齐（段1: 1-{break_idx}行，段2: {break_idx+1}-{len(sung_lines)}行）...")
 
-            print(f"  📄 段落 {s+1}-{e+1}: [{start_t:.2f}s - {end_t:.2f}s]")
-            seg_result = model.align(seg_audio, seg_text, language=lang)
-            if seg_result is None:
-                continue
-            for seg in seg_result.segments:
-                for w in seg.words:
-                    # 时间戳加上段起始偏移（align 返回相对切片开头的时间）
-                    w.start += start_t
-                    w.end += start_t
-                    all_words.append(w)
+            # 段1：断点前歌词，切片精确
+            seg1_lines = sung_lines[:break_idx]
+            # 段1起点：从第一个参考时间前留余量，而非固定从 0s 开始。
+            # 实测验证：若歌曲有较长前奏（如44s纯音乐），从0s开始会让模型在前奏中
+            # "幻听"出歌词（前4行全部错误对齐到2-6s），而从第一个参考时间前5s开始，
+            # 所有行对齐误差均 <1s。若歌曲开头就有演唱（ref_times[0] 很小），保持从 0 开始。
+            PAD_BEFORE = 5.0
+            seg1_start = max(0.0, ref_times[0] - PAD_BEFORE)
+            # 段1切片延伸到段1最后一行参考时间 + 余量，避免段末歌词被截断导致对齐失败。
+            # 网易云参考时间可能比实际发音早，若切片正好到段末参考时间，段末歌词发音会被截断，
+            # 导致 "Failed to align the last N words" 并产生重复/错误的词（如「まだ足りない」被
+            # 识别成「まだまだ」），进而使该行逐字匹配不完整、下一行 start 时间戳错位。
+            PAD_AFTER = 3.0
+            seg1_end = min(ref_times[break_idx-1] + PAD_AFTER, audio_duration)
+            seg1_audio = audio[int(seg1_start*16000):int(seg1_end*16000)]
+            print(f"  📄 段1（{len(seg1_lines)} 行）: [{seg1_start:.2f}s - {seg1_end:.2f}s]")
+            seg1_result = model.align(seg1_audio, "\n".join(seg1_lines), language=lang)
+            if seg1_result is not None:
+                for seg in seg1_result.segments:
+                    for w in seg.words:
+                        w.start += seg1_start
+                        w.end += seg1_start
+                        all_words.append(w)
+
+            # 段2：断点后歌词，切片延伸到音频末尾
+            seg2_lines = sung_lines[break_idx:]
+            # 段2切片起点基于段2第一行（断点后第一行）的参考时间 - 余量。
+            # 注意：不能用断点前一行（ref_times[break_idx-1]）的时间，否则当断点前是
+            # 长间奏时（如副歌之间的间奏），切片起点会过早，把前一段的歌词也包含进来，
+            # 导致模型在切片内错误匹配段2第一行（如「天の神様くださった」被错误对齐到
+            # 前一段副歌末尾的时间点）。
+            seg2_start = max(0.0, ref_times[break_idx] - 5.0)  # 段2第一行前 5s 余量
+            seg2_end = audio_duration
+            seg2_audio = audio[int(seg2_start*16000):int(seg2_end*16000)]
+            print(f"  📄 段2（{len(seg2_lines)} 行）: [{seg2_start:.2f}s - {seg2_end:.2f}s]")
+            seg2_result = model.align(seg2_audio, "\n".join(seg2_lines), language=lang)
+            if seg2_result is not None:
+                for seg in seg2_result.segments:
+                    for w in seg.words:
+                        w.start += seg2_start
+                        w.end += seg2_start
+                        all_words.append(w)
+
+            # ===== 修复时间戳堆叠：对齐失败的词会被赋予相同时间戳，需要插值修复 =====
+            all_words = fix_stacked_timestamps(all_words)
     else:
         # ===== 无参考时间戳，整段对齐 =====
         print("🧠 正在进行强制对齐推理...")
@@ -335,7 +562,7 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                 current_text = new_text
                 current_line_end_time = current_word.end
                 word_idx += 1
-            else:
+            elif target.startswith(word_text):
                 # 词跨越行边界：当前行取需要的部分，剩余留给下一行
                 remaining = target_len - len(current_text)
                 if remaining > 0:
@@ -353,6 +580,11 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                     else:
                         word_idx += 1
                 break
+            else:
+                # 词不属于当前行（对齐错位，如段边界处某行对齐失败导致词缺失）。
+                # 跳过该词，避免错误匹配下一行歌词造成后续所有行错位。
+                word_idx += 1
+                continue
 
         lrc_lines.append(f"{start_time_str}{line}")
         
@@ -377,7 +609,8 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
 
     return {
         "standard_lrc": "\n".join(lrc_lines),
-        "enhanced_lrc": "\n".join(enhanced_lrc_lines)
+        "enhanced_lrc": "\n".join(enhanced_lrc_lines),
+        "debug_info": debug_info_str
     }
 
 @app.get("/api/ping")
@@ -403,6 +636,23 @@ async def api_align(
             tmp.write(content)
             
         print("🎵 音频已保存至临时目录，开始处理...")
+
+        # ===== 保存音频副本到项目 audio/ 目录，方便试听/调试 =====
+        if SAVE_AUDIO:
+            try:
+                audio_dir = os.path.join(application_path, "audio")
+                os.makedirs(audio_dir, exist_ok=True)
+                # 根据文件头识别真实格式，避免 .bin 这种无意义扩展名
+                ext = detect_audio_ext(content)
+                base_name = os.path.splitext(audio.filename)[0] if audio.filename else f"audio_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                save_name = f"{base_name}{ext if ext else '.bin'}"
+                save_path = os.path.join(audio_dir, save_name)
+                with open(save_path, "wb") as f:
+                    f.write(content)
+                print(f"💾 音频已保存到: {save_path}（可打开试听）")
+            except Exception as e:
+                print(f"⚠️ 保存音频副本失败: {e}")
+        # =========================================================
         
         # 解析参考时间戳（可选，JSON 数组，秒）
         ref_times = None
@@ -418,6 +668,9 @@ async def api_align(
             return {"code": 400, "message": lrc_result_dict["error"], "data": None}
             
         log_request(audio.filename, lyrics, lrc_result_dict)
+        
+        # 调试信息仅用于写日志，不返回给前端
+        lrc_result_dict.pop("debug_info", None)
         
         print("✅ 处理完成，返回标准与逐字双轨数据给前端。")
         return {"code": 200, "message": "success", "data": lrc_result_dict}
