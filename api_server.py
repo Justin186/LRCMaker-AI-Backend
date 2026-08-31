@@ -134,7 +134,23 @@ def log_request(audio_name: str, source_text: str, result: dict):
         print(f"⚠️ 写入请求日志失败: {e}")
 
 def clean_str(s):
-    return s.replace(" ", "").replace("\u3000", "").replace("\n", "").replace("\r", "").replace("\t", "")
+    """去除所有不可见空白字符，用于歌词行与模型输出词的匹配。
+
+    注意：除了普通空格、全角空格、换行、回车、制表符外，还必须去除
+    U+00A0（不换行空格 NBSP）、U+200B（零宽空格）等 Unicode 空白字符。
+    实测发现网易云歌词中可能混入 NBSP（如「どうやら私ら\xa0久しく...」），
+    若不去除会导致歌词行 target 与模型输出词无法匹配，进而整段对齐失败。
+    """
+    return (s.replace(" ", "")
+             .replace("\u3000", "")   # 全角空格
+             .replace("\u00a0", "")   # 不换行空格 NBSP
+             .replace("\u200b", "")   # 零宽空格
+             .replace("\u2009", "")   # 窄空格
+             .replace("\u2002", "")   # 半角空格
+             .replace("\u2003", "")   # 全角空格(em)
+             .replace("\n", "")
+             .replace("\r", "")
+             .replace("\t", ""))
 
 def detect_audio_ext(content: bytes) -> str:
     """根据文件头（magic bytes）识别音频格式，返回带点的扩展名（如 '.mp3'）。
@@ -459,14 +475,12 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
             # 所有行对齐误差均 <1s。若歌曲开头就有演唱（ref_times[0] 很小），保持从 0 开始。
             PAD_BEFORE = 5.0
             seg1_start = max(0.0, ref_times[0] - PAD_BEFORE)
-            # 段1切片终点：延伸到断点间奏的大部分范围，而非仅在最后一行参考时间后加固定余量。
-            # 原因：参考时间是该行的 START 时间，不是 END 时间。一行歌词演唱可能跨越数秒甚至十数秒，
-            # 固定 PAD_AFTER 不够（实测段1唱完在108s但切片只到95s，导致段末对齐失败）。
-            # 方案：利用断点间奏的比例（80%）自适应，既给段1足够空间，又不侵入段2范围。
-            # 段2起点在 ref_times[break_idx] - 5.0，此处 80% 不会与之重叠（需 gap > 25s）；
-            # 若 gap 较小则退化为接近 ref_times[break_idx-1] + gap（即覆盖整个间奏），也是安全的。
-            gap_to_next = ref_times[break_idx] - ref_times[break_idx-1]
-            seg1_end = min(ref_times[break_idx-1] + gap_to_next * 0.8, audio_duration)
+            # 段1切片终点：在段2起点之前留固定间隔（5s），确保不重叠。
+            # 段2起点 = ref_times[break_idx] - 5.0（段2第一行前5s余量）。
+            # 段1终点 = max(段1末行ref + 5s, 段2起点 - 5s)，
+            # 保证段1至少覆盖末行参考时间后5s，同时在段2开始前留5s间距。
+            seg2_start = max(0.0, ref_times[break_idx] - 5.0)
+            seg1_end = max(ref_times[break_idx-1] + 5.0, seg2_start - 5.0)
             seg1_audio = audio[int(seg1_start*16000):int(seg1_end*16000)]
             print(f"  📄 段1（{len(seg1_lines)} 行）: [{seg1_start:.2f}s - {seg1_end:.2f}s]")
             seg1_result = model.align(seg1_audio, "\n".join(seg1_lines), language=lang)
@@ -479,12 +493,11 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
 
             # 段2：断点后歌词，切片延伸到音频末尾
             seg2_lines = sung_lines[break_idx:]
-            # 段2切片起点基于段2第一行（断点后第一行）的参考时间 - 余量。
+            # 段2切片起点：已在上方与段1终点一起计算（seg2_start），确保零重叠。
             # 注意：不能用断点前一行（ref_times[break_idx-1]）的时间，否则当断点前是
             # 长间奏时（如副歌之间的间奏），切片起点会过早，把前一段的歌词也包含进来，
             # 导致模型在切片内错误匹配段2第一行（如「天の神様くださった」被错误对齐到
             # 前一段副歌末尾的时间点）。
-            seg2_start = max(0.0, ref_times[break_idx] - 5.0)  # 段2第一行前 5s 余量
             seg2_end = audio_duration
             seg2_audio = audio[int(seg2_start*16000):int(seg2_end*16000)]
             print(f"  📄 段2（{len(seg2_lines)} 行）: [{seg2_start:.2f}s - {seg2_end:.2f}s]")
