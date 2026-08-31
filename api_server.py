@@ -74,10 +74,12 @@ async def lifespan(app: FastAPI):
     if os.path.exists(local_model_path) and os.listdir(local_model_path):
         print(f"📦 发现本地离线模型目录，直接加载免下载：\n   -> {local_model_path}")
         model_target = local_model_path
+        is_local_model = True
     else:
         print(f"🌐 未发现本地离线模型，将尝试从网络或系统缓存加载 '{MODEL_SIZE}' 模型...")
         print(f"   (提示：你可以手动下载模型并放入 {local_model_path} 目录实现完全离线运行)")
         model_target = MODEL_SIZE
+        is_local_model = False
     
     device = pick_device()
     
@@ -87,7 +89,33 @@ async def lifespan(app: FastAPI):
         compute_type="float16" if device == "cuda" else "int8",
         download_root=model_cache_dir
     )
-    
+
+    # 首次从网络下载后，自动复制到项目 models/ 目录，方便下次离线加载
+    if not is_local_model:
+        import shutil
+        # huggingface_hub 缓存结构：~/.lrc_maker_models/models--<org>--<name>/snapshots/<hash>/
+        # 需要从 snapshots 子目录里找到实际模型文件
+        cache_root = os.path.join(model_cache_dir, f"models--Systran--faster-whisper-{MODEL_SIZE}")
+        downloaded_path = None
+        snapshots_dir = os.path.join(cache_root, "snapshots")
+        if os.path.isdir(snapshots_dir):
+            for entry in os.listdir(snapshots_dir):
+                candidate = os.path.join(snapshots_dir, entry)
+                if os.path.isdir(candidate) and os.listdir(candidate):
+                    downloaded_path = candidate
+                    break
+        if downloaded_path and os.path.exists(downloaded_path):
+            try:
+                print(f"📦 正在将模型复制到本地目录以供离线使用：\n   -> {local_model_path}")
+                # symlinks=False（默认）：跟随符号链接复制实际文件内容，
+                # 避免复制出指向 blobs 的无效链接
+                shutil.copytree(downloaded_path, local_model_path, dirs_exist_ok=True, symlinks=False)
+                print(f"✅ 模型已保存到本地，下次启动将直接加载，无需联网。")
+            except Exception as e:
+                print(f"⚠️ 复制模型到本地目录失败（不影响本次运行）: {e}")
+        else:
+            print(f"⚠️ 未在缓存中找到模型文件（{cache_root}），跳过复制。")
+
     print("✅ AI 引擎就绪！请不要关闭此黑色窗口。")
     print("👉 现在去网页里点击 [一键 AI 强制对齐] 吧！")
     yield
