@@ -459,12 +459,14 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
             # 所有行对齐误差均 <1s。若歌曲开头就有演唱（ref_times[0] 很小），保持从 0 开始。
             PAD_BEFORE = 5.0
             seg1_start = max(0.0, ref_times[0] - PAD_BEFORE)
-            # 段1切片延伸到段1最后一行参考时间 + 余量，避免段末歌词被截断导致对齐失败。
-            # 网易云参考时间可能比实际发音早，若切片正好到段末参考时间，段末歌词发音会被截断，
-            # 导致 "Failed to align the last N words" 并产生重复/错误的词（如「まだ足りない」被
-            # 识别成「まだまだ」），进而使该行逐字匹配不完整、下一行 start 时间戳错位。
-            PAD_AFTER = 3.0
-            seg1_end = min(ref_times[break_idx-1] + PAD_AFTER, audio_duration)
+            # 段1切片终点：延伸到断点间奏的大部分范围，而非仅在最后一行参考时间后加固定余量。
+            # 原因：参考时间是该行的 START 时间，不是 END 时间。一行歌词演唱可能跨越数秒甚至十数秒，
+            # 固定 PAD_AFTER 不够（实测段1唱完在108s但切片只到95s，导致段末对齐失败）。
+            # 方案：利用断点间奏的比例（80%）自适应，既给段1足够空间，又不侵入段2范围。
+            # 段2起点在 ref_times[break_idx] - 5.0，此处 80% 不会与之重叠（需 gap > 25s）；
+            # 若 gap 较小则退化为接近 ref_times[break_idx-1] + gap（即覆盖整个间奏），也是安全的。
+            gap_to_next = ref_times[break_idx] - ref_times[break_idx-1]
+            seg1_end = min(ref_times[break_idx-1] + gap_to_next * 0.8, audio_duration)
             seg1_audio = audio[int(seg1_start*16000):int(seg1_end*16000)]
             print(f"  📄 段1（{len(seg1_lines)} 行）: [{seg1_start:.2f}s - {seg1_end:.2f}s]")
             seg1_result = model.align(seg1_audio, "\n".join(seg1_lines), language=lang)
