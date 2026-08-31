@@ -2,6 +2,8 @@ import os
 import sys
 import json
 import socket
+import asyncio
+import itertools
 import tempfile
 import datetime
 import multiprocessing
@@ -40,6 +42,10 @@ ENABLE_REQUEST_LOG = True
 # 是否把上传的音频保存到项目 audio/ 目录（方便试听/调试）。True=保存，False=不保存
 SAVE_AUDIO = True
 # =============================
+
+# 请求计数器：用于检测并丢弃过时请求的结果
+_next_request_id = itertools.count(1)
+_current_request_id = None
 
 def pick_device():
     """自动选择计算设备：优先 CUDA GPU，否则回退 CPU"""
@@ -720,7 +726,13 @@ async def api_align(
     al: str = Form(""),
     times: str = Form("")
 ):
-    print(f"📥 收到请求：音频文件 [{audio.filename}], 文本长度 [{len(lyrics)}]")
+    global _current_request_id
+
+    # 分配本次请求 ID，并标记为当前最新请求
+    request_id = next(_next_request_id)
+    _current_request_id = request_id
+
+    print(f"📥 收到请求 #{request_id}：音频文件 [{audio.filename}], 文本长度 [{len(lyrics)}]")
     
     tmp_path = None 
     try:
@@ -729,14 +741,13 @@ async def api_align(
             content = await audio.read()
             tmp.write(content)
             
-        print("🎵 音频已保存至临时目录，开始处理...")
+        print(f"🎵 请求 #{request_id} 音频已保存至临时目录，开始处理...")
 
         # ===== 保存音频副本到项目 audio/ 目录，方便试听/调试 =====
         if SAVE_AUDIO:
             try:
                 audio_dir = os.path.join(application_path, "audio")
                 os.makedirs(audio_dir, exist_ok=True)
-                # 根据文件头识别真实格式，避免 .bin 这种无意义扩展名
                 ext = detect_audio_ext(content)
                 base_name = os.path.splitext(audio.filename)[0] if audio.filename else f"audio_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 save_name = f"{base_name}{ext if ext else '.bin'}"
@@ -755,7 +766,18 @@ async def api_align(
                 ref_times = json.loads(times)
             except Exception:
                 ref_times = None
-        lrc_result_dict = generate_lrc_content(tmp_path, lyrics, ti, ar, al, times=ref_times)
+
+        # 用 asyncio.to_thread 将同步阻塞的模型推理放到线程池执行，
+        # 不再卡死事件循环，让新请求可以立即开始处理
+        lrc_result_dict = await asyncio.to_thread(
+            generate_lrc_content, tmp_path, lyrics, ti, ar, al, times=ref_times
+        )
+
+        # 处理完后检查：是否有更新的请求已经进来了？
+        # 如果有，本次结果已过时，直接丢弃（避免旧结果覆盖新结果）
+        if _current_request_id != request_id:
+            print(f"⚠️ 请求 #{request_id} 已过时（当前最新为 #{_current_request_id}），丢弃结果。")
+            return {"code": 409, "message": "superseded", "data": None}
         
         if isinstance(lrc_result_dict, dict) and "error" in lrc_result_dict:
             print(lrc_result_dict["error"])
@@ -763,21 +785,17 @@ async def api_align(
             
         log_request(audio.filename, lyrics, lrc_result_dict)
         
-        # 调试信息仅用于写日志，不返回给前端
         lrc_result_dict.pop("debug_info", None)
         
-        print("✅ 处理完成，返回标准与逐字双轨数据给前端。")
+        print(f"✅ 请求 #{request_id} 处理完成，返回标准与逐字双轨数据给前端。")
         return {"code": 200, "message": "success", "data": lrc_result_dict}
         
     except Exception as e:
-        print(f"❌ 发生错误: {str(e)}")
+        print(f"❌ 请求 #{request_id} 发生错误: {str(e)}")
         return {"code": 500, "message": str(e), "data": None}
         
     finally:
         if tmp_path and os.path.exists(tmp_path):
-            # Windows 下音频解码库（soundfile 等）可能未及时释放文件句柄，
-            # 直接删除会报 PermissionError: [WinError 32]。这里带重试地删除，
-            # 多次失败则忽略（临时文件最终会被系统自动清理）。
             for _ in range(5):
                 try:
                     os.unlink(tmp_path)
