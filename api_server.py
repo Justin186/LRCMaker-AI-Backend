@@ -117,12 +117,12 @@ def log_request(audio_name: str, source_text: str, result: dict):
             f.write("[源文本]\n")
             f.write(source_text + "\n")
             f.write("-" * 60 + "\n")
-            # 原始传入数据调试信息（每行歌词 + 参考时间戳），便于排查对齐问题
-            debug_info = result.get("debug_info", "")
-            if debug_info:
-                f.write("[原始传入数据]\n")
-                f.write(debug_info + "\n")
-                f.write("-" * 60 + "\n")
+            # # 原始传入数据调试信息（每行歌词 + 参考时间戳），便于排查对齐问题
+            # debug_info = result.get("debug_info", "")
+            # if debug_info:
+            #     f.write("[原始传入数据]\n")
+            #     f.write(debug_info + "\n")
+            #     f.write("-" * 60 + "\n")
             f.write("[标准 LRC]\n")
             f.write(result.get("standard_lrc", "") + "\n")
             f.write("-" * 60 + "\n")
@@ -151,6 +151,44 @@ def clean_str(s):
              .replace("\n", "")
              .replace("\r", "")
              .replace("\t", ""))
+
+def split_line_to_segments(line):
+    """将歌词行拆分为匹配段，用于逐字对齐。
+
+    CJK 汉字（中日）和日文假名（平假名/片假名）每个字符单独作为一个段，
+    韩文（Hangul 音节）和拉丁文等按空格分词。
+
+    这样可以为中日文歌词生成逐字时间戳，同时保持韩文/英文的逐词时间戳。
+
+    示例:
+        "天下相亲与相爱" → ["天", "下", "相", "亲", "与", "相", "爱"]
+        "If I send"      → ["If", "I", "send"]
+        "ずっとそうだ"    → ["ず", "っ", "と", "そ", "う", "だ"]
+        "나는 읽기"       → ["나는", "읽기"]
+    """
+    segments = []
+    current = ""
+    for char in line:
+        if char == ' ' or char == '\u3000':
+            # 空格/全角空格：保存当前段
+            if current:
+                segments.append(current)
+                current = ""
+        elif ('\u4e00' <= char <= '\u9fff' or  # CJK 统一汉字（中日共用）
+              '\u3400' <= char <= '\u4dbf' or  # CJK 扩展 A
+              '\u3040' <= char <= '\u309f' or  # 平假名
+              '\u30a0' <= char <= '\u30ff'):    # 片假名
+            # CJK 字符：保存当前段，然后单独作为一个段
+            if current:
+                segments.append(current)
+                current = ""
+            segments.append(char)
+        else:
+            # 韩文、拉丁文、数字、标点等：累积到当前段
+            current += char
+    if current:
+        segments.append(current)
+    return segments
 
 def detect_audio_ext(content: bytes) -> str:
     """根据文件头（magic bytes）识别音频格式，返回带点的扩展名（如 '.mp3'）。
@@ -556,64 +594,101 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
             lrc_lines.append(interlude_str)
             enhanced_lrc_lines.append(interlude_str)
 
-        target = clean_str(line)
-        target_len = len(target)
-        current_line_end_time = start_time
-        
-        current_line_words = []
-        current_text = ""
+        # 按原始歌词拆分为匹配段：CJK 逐字，拉丁文逐词（保留单词边界）
+        original_words = split_line_to_segments(line)
+        line_word_results = []  # [(orig_word, start, end), ...]
 
-        while word_idx < total_words and len(current_text) < target_len:
-            current_word = all_words[word_idx]
-            word_text = clean_str(current_word.word)
-            if not word_text:
-                word_idx += 1
+        for orig_word in original_words:
+            target = clean_str(orig_word)
+            if not target:
                 continue
 
-            new_text = current_text + word_text
-            if target.startswith(new_text):
-                # 整个词都在当前行内
-                current_line_words.append(current_word)
-                current_text = new_text
-                current_line_end_time = current_word.end
-                word_idx += 1
-            elif target.startswith(word_text):
-                # 词跨越行边界：当前行取需要的部分，剩余留给下一行
-                remaining = target_len - len(current_text)
-                if remaining > 0:
-                    head_text = word_text[:remaining]
-                    tail_text = word_text[remaining:]
-                    ratio = remaining / len(word_text)
-                    head_end = current_word.start + (current_word.end - current_word.start) * ratio
-                    head_word = SimpleNamespace(word=head_text, start=current_word.start, end=head_end)
-                    current_line_words.append(head_word)
-                    current_text = current_text + head_text
-                    current_line_end_time = head_end
-                    if tail_text:
-                        tail_word = SimpleNamespace(word=tail_text, start=head_end, end=current_word.end)
-                        all_words[word_idx] = tail_word
+            accumulated = ""
+            w_start = None
+            w_end = None
+
+            while word_idx < total_words and len(accumulated) < len(target):
+                current_word = all_words[word_idx]
+                word_text = clean_str(current_word.word)
+
+                if not word_text:
+                    word_idx += 1
+                    continue
+
+                new_acc = accumulated + word_text
+
+                if target.startswith(new_acc):
+                    # 模型词完全在当前原始单词范围内
+                    if w_start is None:
+                        w_start = current_word.start
+                    w_end = current_word.end
+                    accumulated = new_acc
+                    word_idx += 1
+                elif len(word_text) > (len(target) - len(accumulated)):
+                    # 模型词可能跨越原始单词边界，尝试拆分
+                    remaining = len(target) - len(accumulated)
+                    if remaining > 0 and word_text[:remaining] == target[len(accumulated):]:
+                        if w_start is None:
+                            w_start = current_word.start
+                        tail_text = word_text[remaining:]
+                        ratio = remaining / len(word_text)
+                        head_end = current_word.start + (current_word.end - current_word.start) * ratio
+                        w_end = head_end
+                        accumulated = target
+                        if tail_text:
+                            tail_word = SimpleNamespace(word=tail_text, start=head_end, end=current_word.end)
+                            all_words[word_idx] = tail_word
+                        else:
+                            word_idx += 1
                     else:
+                        # 模型词不匹配当前原始单词（对齐错位），跳过
                         word_idx += 1
-                break
-            else:
-                # 词不属于当前行（对齐错位，如段边界处某行对齐失败导致词缺失）。
-                # 跳过该词，避免错误匹配下一行歌词造成后续所有行错位。
-                word_idx += 1
-                continue
+                        continue
+                else:
+                    # 模型词不属于当前原始单词（对齐错位），跳过
+                    word_idx += 1
+                    continue
+
+            if w_start is not None and accumulated:
+                line_word_results.append((orig_word, w_start, w_end))
+
+        # 标准 LRC：用行首词的 start 时间
+        if line_word_results:
+            start_time = line_word_results[0][1]
+            start_time_str = format_time(start_time)
+            current_line_end_time = line_word_results[-1][2]
+        else:
+            current_line_end_time = prev_line_end_time + 0.1 if prev_line_end_time > 0 else 0.1
+            start_time_str = "[99:99.99]"
 
         lrc_lines.append(f"{start_time_str}{line}")
-        
-        valid_words = [w for w in current_line_words if clean_str(w.word)]
-        enhanced_line_str = f"{start_time_str}"
-        for i, w in enumerate(valid_words):
-            clean_word = clean_str(w.word)
-            enhanced_line_str += f"{clean_word}{format_time(w.end)}"
-            # 若下一词起始与当前词结束不一致（句中停顿），额外标记下一词起始时间
-            if i < len(valid_words) - 1:
-                next_w = valid_words[i + 1]
-                if next_w.start - w.end > GAP_THRESHOLD:
-                    enhanced_line_str += format_time(next_w.start)
-        enhanced_lrc_lines.append(enhanced_line_str)
+
+        # 增强 LRC：使用原始歌词单词，格式 [start]word1 [end1]word2 [end2]...wordN[endN]
+        if line_word_results:
+            enhanced_line_str = format_time(line_word_results[0][1])
+            for i, (word, ws, we) in enumerate(line_word_results):
+                enhanced_line_str += word
+                if i < len(line_word_results) - 1:
+                    next_ws = line_word_results[i + 1][1]
+                    # 连续 CJK 字符之间不加空格（中日文逐字无需空格分隔）
+                    next_word = line_word_results[i + 1][0]
+                    both_cjk = (len(word) == 1 and len(next_word) == 1 and
+                                (('\u4e00' <= word <= '\u9fff') or ('\u3400' <= word <= '\u4dbf') or
+                                 ('\u3040' <= word <= '\u309f') or ('\u30a0' <= word <= '\u30ff')) and
+                                (('\u4e00' <= next_word <= '\u9fff') or ('\u3400' <= next_word <= '\u4dbf') or
+                                 ('\u3040' <= next_word <= '\u309f') or ('\u30a0' <= next_word <= '\u30ff')))
+                    if both_cjk:
+                        enhanced_line_str += format_time(we)
+                    else:
+                        enhanced_line_str += " " + format_time(we)
+                    # 若下一词起始与当前词结束不一致（句中停顿），额外标记下一词起始时间
+                    if next_ws - we > GAP_THRESHOLD:
+                        enhanced_line_str += format_time(next_ws)
+                else:
+                    enhanced_line_str += format_time(we)
+            enhanced_lrc_lines.append(enhanced_line_str)
+        else:
+            enhanced_lrc_lines.append(f"{start_time_str}{line}")
 
         prev_line_end_time = current_line_end_time
 
