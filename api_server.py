@@ -158,21 +158,25 @@ def split_line_to_segments(line):
     CJK 汉字（中日）和日文假名（平假名/片假名）每个字符单独作为一个段，
     韩文（Hangul 音节）和拉丁文等按空格分词。
 
-    这样可以为中日文歌词生成逐字时间戳，同时保持韩文/英文的逐词时间戳。
+    返回 (segments, end_positions)：
+    - segments: 拆分后的文本段列表
+    - end_positions: 每段在原始行中的结束位置（用于判断段间是否有空格）
 
     示例:
-        "天下相亲与相爱" → ["天", "下", "相", "亲", "与", "相", "爱"]
-        "If I send"      → ["If", "I", "send"]
-        "ずっとそうだ"    → ["ず", "っ", "と", "そ", "う", "だ"]
-        "나는 읽기"       → ["나는", "읽기"]
+        "天下相亲与相爱" → ["天","下","相","亲","与","相","爱"], [1,2,3,4,5,6,7]
+        "If I send"      → ["If","I","send"], [2,4,8]
+        "天下相爱 动身"   → ["天","下","相","爱","动","身"], [1,2,3,4,6,7]
+                                                    ↑ 第4段"爱"结束于位置4，line[4]=' ' → 有空格
     """
     segments = []
+    end_positions = []
     current = ""
-    for char in line:
+    for i, char in enumerate(line):
         if char == ' ' or char == '\u3000':
-            # 空格/全角空格：保存当前段
+            # 空格/全角空格：保存当前段，记录结束位置在空格之前
             if current:
                 segments.append(current)
+                end_positions.append(i)
                 current = ""
         elif ('\u4e00' <= char <= '\u9fff' or  # CJK 统一汉字（中日共用）
               '\u3400' <= char <= '\u4dbf' or  # CJK 扩展 A
@@ -181,14 +185,17 @@ def split_line_to_segments(line):
             # CJK 字符：保存当前段，然后单独作为一个段
             if current:
                 segments.append(current)
+                end_positions.append(i)
                 current = ""
             segments.append(char)
+            end_positions.append(i + 1)
         else:
             # 韩文、拉丁文、数字、标点等：累积到当前段
             current += char
     if current:
         segments.append(current)
-    return segments
+        end_positions.append(len(line))
+    return segments, end_positions
 
 def detect_audio_ext(content: bytes) -> str:
     """根据文件头（magic bytes）识别音频格式，返回带点的扩展名（如 '.mp3'）。
@@ -594,11 +601,11 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
             lrc_lines.append(interlude_str)
             enhanced_lrc_lines.append(interlude_str)
 
-        # 按原始歌词拆分为匹配段：CJK 逐字，拉丁文逐词（保留单词边界）
-        original_words = split_line_to_segments(line)
-        line_word_results = []  # [(orig_word, start, end), ...]
+        # 按原始歌词拆分为匹配段：CJK 逐字，拉丁文逐词（保留单词边界和位置信息）
+        original_words, seg_ends = split_line_to_segments(line)
+        line_word_results = []  # [(orig_word, start, end, seg_end_pos), ...]
 
-        for orig_word in original_words:
+        for seg_idx, orig_word in enumerate(original_words):
             target = clean_str(orig_word)
             if not target:
                 continue
@@ -650,7 +657,7 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                     continue
 
             if w_start is not None and accumulated:
-                line_word_results.append((orig_word, w_start, w_end))
+                line_word_results.append((orig_word, w_start, w_end, seg_ends[seg_idx]))
 
         # 标准 LRC：用行首词的 start 时间
         if line_word_results:
@@ -666,21 +673,18 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
         # 增强 LRC：使用原始歌词单词，格式 [start]word1 [end1]word2 [end2]...wordN[endN]
         if line_word_results:
             enhanced_line_str = format_time(line_word_results[0][1])
-            for i, (word, ws, we) in enumerate(line_word_results):
+            for i, (word, ws, we, seg_end) in enumerate(line_word_results):
                 enhanced_line_str += word
                 if i < len(line_word_results) - 1:
                     next_ws = line_word_results[i + 1][1]
-                    # 连续 CJK 字符之间不加空格（中日文逐字无需空格分隔）
-                    next_word = line_word_results[i + 1][0]
-                    both_cjk = (len(word) == 1 and len(next_word) == 1 and
-                                (('\u4e00' <= word <= '\u9fff') or ('\u3400' <= word <= '\u4dbf') or
-                                 ('\u3040' <= word <= '\u309f') or ('\u30a0' <= word <= '\u30ff')) and
-                                (('\u4e00' <= next_word <= '\u9fff') or ('\u3400' <= next_word <= '\u4dbf') or
-                                 ('\u3040' <= next_word <= '\u309f') or ('\u30a0' <= next_word <= '\u30ff')))
-                    if both_cjk:
-                        enhanced_line_str += format_time(we)
-                    else:
+                    # 根据原始行中该段之后是否有空格来决定输出空格
+                    # 这样既保留了原始歌词的分词（如"爱 动"之间的空格），
+                    # 又不会在连续 CJK 字符间插入多余空格（如"天下"之间）
+                    has_space_after = seg_end < len(line) and line[seg_end] in (' ', '\u3000')
+                    if has_space_after:
                         enhanced_line_str += " " + format_time(we)
+                    else:
+                        enhanced_line_str += format_time(we)
                     # 若下一词起始与当前词结束不一致（句中停顿），额外标记下一词起始时间
                     if next_ws - we > GAP_THRESHOLD:
                         enhanced_line_str += format_time(next_ws)
