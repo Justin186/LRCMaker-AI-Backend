@@ -6,6 +6,8 @@ import asyncio
 import itertools
 import tempfile
 import datetime
+import warnings
+import re
 import multiprocessing
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -42,6 +44,32 @@ ENABLE_REQUEST_LOG = True
 # 是否把上传的音频保存到项目 audio/ 目录（方便试听/调试）。True=保存，False=不保存
 SAVE_AUDIO = True
 # =============================
+
+# ===== 自定义警告处理器：美化 stable_whisper 的对齐警告输出 =====
+_original_showwarning = warnings.showwarning
+_warning_buffer = []
+
+def _beautified_showwarning(message, category, filename, lineno, file=None, line=None):
+    """将 stable_whisper 的原始 Python 警告重新格式化为简洁美观的输出"""
+    msg = str(message)
+    # 只拦截来自 stable_whisper.alignment 的警告
+    if "stable_whisper" in (filename or ""):
+        # 匹配 "Failed to align the last N/M words after HH:MM:SS."
+        m = re.match(r"Failed to align the last (\d+)/(\d+) words after (\d+:\d+:\d+\.\d+)\.", msg)
+        if m:
+            failed, total, ts = m.group(1), m.group(2), m.group(3)
+            print(f"  ⚠️  对齐警告: 尾部 {failed}/{total} 个词在 {ts} 后未能对齐（已跳过）")
+            return
+        # 匹配 "N/M segments failed to align."
+        m = re.match(r"(\d+)/(\d+) segments? failed to align\.", msg)
+        if m:
+            failed, total = m.group(1), m.group(2)
+            print(f"  ⚠️  对齐警告: {failed}/{total} 个分段未能对齐（已跳过）")
+            return
+    # 其他警告保持原样
+    _original_showwarning(message, category, filename, lineno, file, line)
+
+warnings.showwarning = _beautified_showwarning
 
 # 请求计数器：用于检测并丢弃过时请求的结果
 _next_request_id = itertools.count(1)
@@ -521,14 +549,12 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
             # ===== 修复时间戳堆叠：对齐失败的词会被赋予相同时间戳，需要插值修复 =====
             all_words = fix_stacked_timestamps(all_words)
         else:
-            # ===== 参考时间戳可靠，用"最大间奏断点 2 段方案"对齐 =====
-            # 实测发现：把歌词切成很多小段（每段切片精确到下一段参考时间）时，
-            # 中间段落（尤其 15+ 行的大段）段末歌词会对齐失败并堆叠
-            # （"Failed to align the last N words"），因为切片边界截断了段末歌词。
-            # 更稳健的方案：找参考时间戳的最大间奏间隔作为断点，把歌词分成 2 段：
-            #   段1: 断点前歌词，切片精确（0 到断点前参考时间）
-            #   段2: 断点后歌词，切片延伸到音频末尾（模型有足够范围识别所有歌词）
-            # 实测该方案所有行时间戳都正确展开（误差 < 1s）。
+            # ===== 参考时间戳可靠，先找最大间奏断点，再决定是否分段 =====
+            # 找最大间奏间隔作为断点后，根据歌词长度和间奏大小决定策略：
+            # - 短歌词（≤25行）或间奏小（≤8s）：整段对齐（效果更好）
+            # - 长歌词（>25行）+ 大间奏（>8s）：2 段方案（避免模型漂移）
+            # 2 段方案细节：段1 切片精确（0 到断点前参考时间），
+            # 段2 切片延伸到音频末尾（模型有足够范围识别所有歌词）。
             audio = load_audio(audio_path)  # 16kHz numpy 数组
             audio_duration = audio.shape[0] / 16000.0
 
@@ -550,9 +576,27 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                     max_gap = gap
                     break_idx = i  # 断点在第 i 行之前
 
-            # 安全防护：只有 1 行歌词（或 break_idx 未找到）时，跳过 2 段切分，直接整段对齐
-            if len(sung_lines) < 2 or break_idx < 0:
-                print(f"🧠 只有 {len(sung_lines)} 行歌词，跳过 2 段切分，整段对齐...")
+            # ===== 决策：整段对齐 vs 2 段方案 =====
+            # 实测短歌词（≤25行）整段处理效果更好，强制分段反而引入边界对齐误差。
+            # 2 段方案仅适用于长歌词（>25行）+ 大间奏（>8s）的情况。
+            SHORT_LYRICS_THRESHOLD = 25
+            MAX_GAP_THRESHOLD = 8.0
+            use_single_segment = (
+                len(sung_lines) < 2
+                or break_idx < 0
+                or len(sung_lines) <= SHORT_LYRICS_THRESHOLD
+                or max_gap <= MAX_GAP_THRESHOLD
+            )
+
+            if use_single_segment:
+                reason = []
+                if len(sung_lines) < 2:
+                    reason.append(f"只有 {len(sung_lines)} 行歌词")
+                elif len(sung_lines) <= SHORT_LYRICS_THRESHOLD:
+                    reason.append(f"歌词较短（{len(sung_lines)} 行 ≤ {SHORT_LYRICS_THRESHOLD}）")
+                elif max_gap <= MAX_GAP_THRESHOLD:
+                    reason.append(f"最大间奏仅 {max_gap:.2f}s ≤ {MAX_GAP_THRESHOLD}s")
+                print(f"🧠 {' + '.join(reason)}，跳过 2 段切分，整段对齐...")
                 seg_start = max(0.0, ref_times[0] - 5.0) if ref_times else 0.0
                 seg_audio = audio[int(seg_start * 16000):]
                 result = model.align(seg_audio, full_text, language=lang)
@@ -564,8 +608,9 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                             all_words.append(w)
                 all_words = fix_stacked_timestamps(all_words)
             else:
-                print(f"🧠 最大间奏间隔 {max_gap:.2f}s，断点在第 {break_idx} 行之前，"
-                      f"用 2 段方案对齐（段1: 1-{break_idx}行，段2: {break_idx+1}-{len(sung_lines)}行）...")
+                print(f"🧠 最大间奏间隔 {max_gap:.2f}s（>{MAX_GAP_THRESHOLD}s），"
+                      f"歌词 {len(sung_lines)} 行（>{SHORT_LYRICS_THRESHOLD}），"
+                      f"断点在第 {break_idx} 行之前，用 2 段方案对齐...")
 
                 # 段1：断点前歌词，切片精确
                 seg1_lines = sung_lines[:break_idx]
