@@ -321,6 +321,12 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
         return {"error": "❌ 错误：未在文本中找到有效歌词，请检查排版。"}
 
     full_text = "\n".join(sung_lines)
+
+    # 纯音乐检测：歌词文本为"纯音乐，请欣赏"等占位符时，无需对齐
+    pure_music_patterns = ["纯音乐", "纯音樂", " instrumental", "（伴奏）", "(伴奏)", "暂无歌词"]
+    if any(pat in full_text for pat in pure_music_patterns):
+        return {"error": "❌ 这是一首纯音乐，没有歌词可供对齐。"}
+
     lang = detect_language(full_text)
     print(f"🌐 检测到歌词语言: {lang}")
 
@@ -543,53 +549,57 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                 if gap > max_gap:
                     max_gap = gap
                     break_idx = i  # 断点在第 i 行之前
-            print(f"🧠 最大间奏间隔 {max_gap:.2f}s，断点在第 {break_idx} 行之前，"
-                  f"用 2 段方案对齐（段1: 1-{break_idx}行，段2: {break_idx+1}-{len(sung_lines)}行）...")
 
-            # 段1：断点前歌词，切片精确
-            seg1_lines = sung_lines[:break_idx]
-            # 段1起点：从第一个参考时间前留余量，而非固定从 0s 开始。
-            # 实测验证：若歌曲有较长前奏（如44s纯音乐），从0s开始会让模型在前奏中
-            # "幻听"出歌词（前4行全部错误对齐到2-6s），而从第一个参考时间前5s开始，
-            # 所有行对齐误差均 <1s。若歌曲开头就有演唱（ref_times[0] 很小），保持从 0 开始。
-            PAD_BEFORE = 5.0
-            seg1_start = max(0.0, ref_times[0] - PAD_BEFORE)
-            # 段1切片终点：在段2起点之前留固定间隔（5s），确保不重叠。
-            # 段2起点 = ref_times[break_idx] - 5.0（段2第一行前5s余量）。
-            # 段1终点 = max(段1末行ref + 5s, 段2起点 - 5s)，
-            # 保证段1至少覆盖末行参考时间后5s，同时在段2开始前留5s间距。
-            seg2_start = max(0.0, ref_times[break_idx] - 5.0)
-            seg1_end = max(ref_times[break_idx-1] + 5.0, seg2_start - 5.0)
-            seg1_audio = audio[int(seg1_start*16000):int(seg1_end*16000)]
-            print(f"  📄 段1（{len(seg1_lines)} 行）: [{seg1_start:.2f}s - {seg1_end:.2f}s]")
-            seg1_result = model.align(seg1_audio, "\n".join(seg1_lines), language=lang)
-            if seg1_result is not None:
-                for seg in seg1_result.segments:
-                    for w in seg.words:
-                        w.start += seg1_start
-                        w.end += seg1_start
-                        all_words.append(w)
+            # 安全防护：只有 1 行歌词（或 break_idx 未找到）时，跳过 2 段切分，直接整段对齐
+            if len(sung_lines) < 2 or break_idx < 0:
+                print(f"🧠 只有 {len(sung_lines)} 行歌词，跳过 2 段切分，整段对齐...")
+                seg_start = max(0.0, ref_times[0] - 5.0) if ref_times else 0.0
+                seg_audio = audio[int(seg_start * 16000):]
+                result = model.align(seg_audio, full_text, language=lang)
+                if result is not None:
+                    for seg in result.segments:
+                        for w in seg.words:
+                            w.start += seg_start
+                            w.end += seg_start
+                            all_words.append(w)
+                all_words = fix_stacked_timestamps(all_words)
+            else:
+                print(f"🧠 最大间奏间隔 {max_gap:.2f}s，断点在第 {break_idx} 行之前，"
+                      f"用 2 段方案对齐（段1: 1-{break_idx}行，段2: {break_idx+1}-{len(sung_lines)}行）...")
 
-            # 段2：断点后歌词，切片延伸到音频末尾
-            seg2_lines = sung_lines[break_idx:]
-            # 段2切片起点：已在上方与段1终点一起计算（seg2_start），确保零重叠。
-            # 注意：不能用断点前一行（ref_times[break_idx-1]）的时间，否则当断点前是
-            # 长间奏时（如副歌之间的间奏），切片起点会过早，把前一段的歌词也包含进来，
-            # 导致模型在切片内错误匹配段2第一行（如「天の神様くださった」被错误对齐到
-            # 前一段副歌末尾的时间点）。
-            seg2_end = audio_duration
-            seg2_audio = audio[int(seg2_start*16000):int(seg2_end*16000)]
-            print(f"  📄 段2（{len(seg2_lines)} 行）: [{seg2_start:.2f}s - {seg2_end:.2f}s]")
-            seg2_result = model.align(seg2_audio, "\n".join(seg2_lines), language=lang)
-            if seg2_result is not None:
-                for seg in seg2_result.segments:
-                    for w in seg.words:
-                        w.start += seg2_start
-                        w.end += seg2_start
-                        all_words.append(w)
+                # 段1：断点前歌词，切片精确
+                seg1_lines = sung_lines[:break_idx]
+                # 段1起点：从第一个参考时间前留余量，而非固定从 0s 开始。
+                PAD_BEFORE = 5.0
+                seg1_start = max(0.0, ref_times[0] - PAD_BEFORE)
+                # 段1切片终点：在段2起点之前留固定间隔（5s），确保不重叠。
+                seg2_start = max(0.0, ref_times[break_idx] - 5.0)
+                seg1_end = max(ref_times[break_idx-1] + 5.0, seg2_start - 5.0)
+                seg1_audio = audio[int(seg1_start*16000):int(seg1_end*16000)]
+                print(f"  📄 段1（{len(seg1_lines)} 行）: [{seg1_start:.2f}s - {seg1_end:.2f}s]")
+                seg1_result = model.align(seg1_audio, "\n".join(seg1_lines), language=lang)
+                if seg1_result is not None:
+                    for seg in seg1_result.segments:
+                        for w in seg.words:
+                            w.start += seg1_start
+                            w.end += seg1_start
+                            all_words.append(w)
 
-            # ===== 修复时间戳堆叠：对齐失败的词会被赋予相同时间戳，需要插值修复 =====
-            all_words = fix_stacked_timestamps(all_words)
+                # 段2：断点后歌词，切片延伸到音频末尾
+                seg2_lines = sung_lines[break_idx:]
+                seg2_end = audio_duration
+                seg2_audio = audio[int(seg2_start*16000):int(seg2_end*16000)]
+                print(f"  📄 段2（{len(seg2_lines)} 行）: [{seg2_start:.2f}s - {seg2_end:.2f}s]")
+                seg2_result = model.align(seg2_audio, "\n".join(seg2_lines), language=lang)
+                if seg2_result is not None:
+                    for seg in seg2_result.segments:
+                        for w in seg.words:
+                            w.start += seg2_start
+                            w.end += seg2_start
+                            all_words.append(w)
+
+                # ===== 修复时间戳堆叠：对齐失败的词会被赋予相同时间戳，需要插值修复 =====
+                all_words = fix_stacked_timestamps(all_words)
     else:
         # ===== 无参考时间戳，整段对齐 =====
         print("🧠 正在进行强制对齐推理...")
