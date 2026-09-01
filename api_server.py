@@ -577,14 +577,16 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                     break_idx = i  # 断点在第 i 行之前
 
             # ===== 决策：整段对齐 vs 2 段方案 =====
-            # 实测短歌词（≤25行）整段处理效果更好，强制分段反而引入边界对齐误差。
-            # 2 段方案仅适用于长歌词（>25行）+ 大间奏（>8s）的情况。
+            # 实测短歌词（≤25行）或短音频（<90s）整段处理效果更好，强制分段反而引入边界对齐误差。
+            # 2 段方案仅适用于长歌词（>25行）+ 长音频（≥90s）+ 大间奏（>8s）的情况。
             SHORT_LYRICS_THRESHOLD = 25
+            SHORT_AUDIO_THRESHOLD = 90.0  # 秒（1分30秒）
             MAX_GAP_THRESHOLD = 8.0
             use_single_segment = (
                 len(sung_lines) < 2
                 or break_idx < 0
                 or len(sung_lines) <= SHORT_LYRICS_THRESHOLD
+                or audio_duration < SHORT_AUDIO_THRESHOLD
                 or max_gap <= MAX_GAP_THRESHOLD
             )
 
@@ -594,6 +596,8 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                     reason.append(f"只有 {len(sung_lines)} 行歌词")
                 elif len(sung_lines) <= SHORT_LYRICS_THRESHOLD:
                     reason.append(f"歌词较短（{len(sung_lines)} 行 ≤ {SHORT_LYRICS_THRESHOLD}）")
+                elif audio_duration < SHORT_AUDIO_THRESHOLD:
+                    reason.append(f"音频较短（{audio_duration:.1f}s < {SHORT_AUDIO_THRESHOLD:.0f}s）")
                 elif max_gap <= MAX_GAP_THRESHOLD:
                     reason.append(f"最大间奏仅 {max_gap:.2f}s ≤ {MAX_GAP_THRESHOLD}s")
                 print(f"🧠 {' + '.join(reason)}，跳过 2 段切分，整段对齐...")
@@ -608,8 +612,9 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                             all_words.append(w)
                 all_words = fix_stacked_timestamps(all_words)
             else:
-                print(f"🧠 最大间奏间隔 {max_gap:.2f}s（>{MAX_GAP_THRESHOLD}s），"
+                print(f"🧠 音频 {audio_duration:.1f}s（≥{SHORT_AUDIO_THRESHOLD:.0f}s），"
                       f"歌词 {len(sung_lines)} 行（>{SHORT_LYRICS_THRESHOLD}），"
+                      f"最大间奏 {max_gap:.2f}s（>{MAX_GAP_THRESHOLD}s），"
                       f"断点在第 {break_idx} 行之前，用 2 段方案对齐...")
 
                 # 段1：断点前歌词，切片精确
