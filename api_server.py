@@ -454,6 +454,10 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
         SEGMENT_GAP = 10.0  # 相邻行时间差超过该值视为间奏断点（秒）
         STACK_RUN = 5      # 连续至少 5 行挤在一起视为堆叠
         STACK_SPAN = 2.0   # 挤在一起的时间跨度阈值（秒）
+        # 二次验证：区分"真正堆叠"（对齐失败，时间戳几乎相同）和"自然快唱"（时间戳递增但间隔小）
+        # 真正堆叠：连续行间隔 < 0.015s（时间戳几乎停滞）
+        # 自然快唱：连续行间隔 >= 0.015s（时间戳正常递增，如"消去しても"×8）
+        STACK_MIN_GAP = 0.015  # 连续行最小间隔阈值（秒）
         stack_start = None
         i = 0
         while i < len(ref_times):
@@ -461,13 +465,20 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
             while j < len(ref_times) and (ref_times[j] - ref_times[i]) < STACK_SPAN:
                 j += 1
             if (j - i) >= STACK_RUN:
+                # 二次验证：检查连续行的最小间隔
+                # 如果间隔 >= STACK_MIN_GAP，说明时间戳在正常递增（自然快唱），非真正堆叠
+                min_consecutive_gap = min(ref_times[k+1] - ref_times[k] for k in range(i, j-1))
+                if min_consecutive_gap >= STACK_MIN_GAP:
+                    # 时间戳在递增，是自然快唱，跳过此区域
+                    i = j
+                    continue
                 stack_start = i
                 break
             i += 1
 
         if stack_start is not None:
             print(f"⚠️ 参考时间戳在第 {stack_start} 行之后出现堆叠（{j-i} 行挤在 "
-                  f"{ref_times[j-1]-ref_times[i]:.2f}s 内），参考时间戳后半部分不可靠！")
+                  f"{ref_times[j-1]-ref_times[i]:.2f}s 内，最小间隔 {min_consecutive_gap:.4f}s），参考时间戳后半部分不可靠！")
             # 后半部分包含堆叠前 2 行作为锚点，帮助模型定位切片起始位置
             ANCHOR_LINES = 2
             anchor_start = max(0, stack_start - ANCHOR_LINES)
