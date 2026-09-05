@@ -383,6 +383,15 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
         当 stable_whisper 对齐失败时，失败的词会被赋予相同的时间戳（通常是段尾时间），
         导致大量词堆积在同一时间点。此函数检测连续多个词时间戳完全相同的"卡住"区域，
         并通过线性插值修复，最后做单调递增校正保证时间戳不倒退。
+
+        两种检测标准（互补）：
+        - 宽松标准（span）：连续 ≥MIN_STUCK_RUN 个词挤在 STUCK_SPAN 秒内。
+          对齐失败时可能给间隔极小（0.01s）的时间戳，用时间跨度检测更稳健。
+        - 严格标准（exact）：连续 ≥MIN_EXACT_STUCK_RUN 个词时间戳完全相同（间隔 < EXACT_EPS）。
+          "时间戳完全相同"是比"挤在一起"强得多的堆叠信号，因此阈值可以更低。
+          注意：模型会把字符合并成词（如「にな」「って」），所以一行歌词堆叠时
+          在模型词层面往往只有 3-5 个词。实测「に な っ て 冬」5 字堆叠 = 模型词
+          「にな」「って」「冬」3 个，阈值必须 ≤3 才能检测到。
         """
         if len(words) < 2:
             return words
@@ -390,11 +399,10 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
         fixed = [SimpleNamespace(word=w.word, start=w.start, end=w.end) for w in words]
         n = len(fixed)
 
-        # 检测"卡住"区域：连续多个词挤在极短的时间跨度内（间隔极小）。
-        # 对齐失败时，stable_whisper 可能给所有词相同时间戳，也可能给间隔极小（0.01s）
-        # 的时间戳。因此用"时间跨度"而非"完全相同"来检测，更稳健。
-        MIN_STUCK_RUN = 15   # 至少连续15个词挤在一起才视为卡住（正常歌词一行最多10-15字）
-        STUCK_SPAN = 0.5     # 挤在一起的时间跨度阈值（秒）
+        MIN_STUCK_RUN = 15      # 宽松标准：至少连续15个词挤在 STUCK_SPAN 内才视为卡住
+        STUCK_SPAN = 0.5        # 挤在一起的时间跨度阈值（秒）
+        MIN_EXACT_STUCK_RUN = 3 # 严格标准：至少连续3个词时间戳完全相同才视为卡住
+        EXACT_EPS = 0.001       # 时间戳"完全相同"的容差（秒）
 
         i = 0
         while i < n:
@@ -404,27 +412,43 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                 j += 1
 
             run_len = j - i
-            if run_len >= MIN_STUCK_RUN:
+
+            # 区域内时间戳完全相同的连续子段最大长度（严格标准）
+            max_exact_run = 1
+            cur_exact_run = 1
+            for k in range(i + 1, j):
+                if abs(fixed[k].start - fixed[k - 1].start) < EXACT_EPS:
+                    cur_exact_run += 1
+                    max_exact_run = max(max_exact_run, cur_exact_run)
+                else:
+                    cur_exact_run = 1
+
+            if run_len >= MIN_STUCK_RUN or max_exact_run >= MIN_EXACT_STUCK_RUN:
                 # 找到卡住区域，进行插值修复
                 # 前边界：卡住区域前最后一个词的 end 时间
                 prev_end = fixed[i - 1].end if i > 0 else 0.0
+
+                # 插值起点：优先用卡住区域自身的起始时间（模型检测到的段起点），
+                # 而不是前一个词的 end。否则段首整行堆叠时（如间奏后），
+                # 会把词铺满整个间奏空隙，导致时间戳整体偏早。
+                start_t = max(fixed[i].start, prev_end)
 
                 # 后边界：卡住区域后第一个词的 start 时间
                 next_start = fixed[j].start if j < n else None
 
                 # 确定插值终点：优先用后一个正常词的 start，否则向后展开
-                if next_start is not None and next_start > prev_end:
+                if next_start is not None and next_start > start_t:
                     end_t = next_start
                 else:
                     # 卡住区域在末尾，或后边界不合法：向后展开，每词至少 0.3s
-                    end_t = prev_end + max(run_len * 0.3, 1.0)
+                    end_t = start_t + max(run_len * 0.3, 1.0)
 
-                total_time = end_t - prev_end
+                total_time = end_t - start_t
                 step = total_time / (run_len + 1)
 
                 for k in range(run_len):
-                    fixed[i + k].start = prev_end + step * (k + 1)
-                    fixed[i + k].end = prev_end + step * (k + 1) + step * 0.8
+                    fixed[i + k].start = start_t + step * (k + 1)
+                    fixed[i + k].end = start_t + step * (k + 1) + step * 0.8
 
                 i = j
             else:
