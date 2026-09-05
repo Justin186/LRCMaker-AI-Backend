@@ -52,10 +52,12 @@ _warning_buffer = []
 def _beautified_showwarning(message, category, filename, lineno, file=None, line=None):
     """将 stable_whisper 的原始 Python 警告重新格式化为简洁美观的输出"""
     msg = str(message)
-    # 只拦截来自 stable_whisper.alignment 的警告
+    # 只拦截来自 stable_whisper 的警告
     if "stable_whisper" in (filename or ""):
-        # 匹配 "Failed to align the last N/M words after HH:MM:SS."
-        m = re.match(r"Failed to align the last (\d+)/(\d+) words after (\d+:\d+:\d+\.\d+)\.", msg)
+        # 匹配 "Failed to align the last N/M words after TS."
+        # 时间戳格式：不足 1 小时为 MM:SS.d（如 01:03.900），
+        # 超过 1 小时为 H:MM:SS.d（如 01:01:03.900），两种都要能匹配
+        m = re.match(r"Failed to align the last (\d+)/(\d+) words after ((?:\d+:)?\d+:\d+\.\d+)\.", msg)
         if m:
             failed, total, ts = m.group(1), m.group(2), m.group(3)
             print(f"  ⚠️  对齐警告: 尾部 {failed}/{total} 个词在 {ts} 后未能对齐（已跳过）")
@@ -65,6 +67,17 @@ def _beautified_showwarning(message, category, filename, lineno, file=None, line
         if m:
             failed, total = m.group(1), m.group(2)
             print(f"  ⚠️  对齐警告: {failed}/{total} 个分段未能对齐（已跳过）")
+            return
+        # 匹配 "Failed to align text."（整次对齐完全失败，未产出任何词）
+        if re.match(r"Failed to align text\.", msg):
+            print("  ⚠️  对齐警告: 本次对齐完全失败，模型未能在音频中定位任何歌词")
+            return
+        # 匹配 "Alignment aborted. Failed word percentage exceeded X% at TS."
+        # （失败词比例超过阈值，对齐器中途放弃）
+        m = re.match(r"Alignment aborted\. Failed word percentage exceeded (\d+)% at ((?:\d+:)?\d+:\d+\.\d+)\.", msg)
+        if m:
+            pct, ts = m.group(1), m.group(2)
+            print(f"  ⚠️  对齐警告: 失败词比例超过 {pct}%，对齐器在 {ts} 处中止")
             return
     # 其他警告保持原样
     _original_showwarning(message, category, filename, lineno, file, line)
@@ -612,9 +625,9 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                 for (s, e) in front_segments:
                     seg_text = "\n".join(sung_lines[s:e+1])
                     PAD_BEFORE = 1.0
-                    PAD_AFTER = 5.0
+                    PAD_AFTER = 3.0
                     start_t = max(0.0, ref_times[s] - PAD_BEFORE)
-                    seg_tail_min = ref_times[e] + 5.0 + PAD_AFTER
+                    seg_tail_min = ref_times[e] + 3.0 + PAD_AFTER
                     if e + 1 < anchor_start:
                         end_t = max(ref_times[e+1] + PAD_AFTER, seg_tail_min)
                     else:
@@ -712,7 +725,7 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                 elif len(segments) < 2:
                     reason.append(f"没有 >{MAX_GAP_THRESHOLD:.0f}s 的大间奏")
                 print(f"🧠 {' + '.join(reason)}，跳过切分，整段对齐...")
-                seg_start = max(0.0, ref_times[0] - 5.0) if ref_times else 0.0
+                seg_start = max(0.0, ref_times[0] - 3.0) if ref_times else 0.0
                 seg_audio = audio[int(seg_start * 16000):]
                 result = model.align(seg_audio, full_text, language=lang)
                 if result is not None:
@@ -737,19 +750,19 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                       f"（{gap_descs}），用 {len(segments)} 段方案对齐...")
 
                 # ===== 逐段对齐 =====
-                # 边界 padding 沿用原 2 段方案的 PAD_BEFORE=5s 策略：
+                # 边界 padding 策略（PAD_BEFORE=3s）：
                 # - 段起点：从该段第一行参考时间前推 PAD_BEFORE
-                # - 段终点（非末段）：max(末行参考时间 + 5s, 下一段起点 - 5s)
+                # - 段终点（非末段）：max(末行参考时间 + 3s, 下一段起点 - 3s)
                 # - 段终点（末段）：延伸到音频末尾，确保模型有足够范围
-                PAD_BEFORE = 5.0
+                PAD_BEFORE = 3.0
                 for k, (s, e) in enumerate(segments):
                     seg_lines = sung_lines[s:e + 1]
                     seg_start_t = max(0.0, ref_times[s] - PAD_BEFORE)
                     if k + 1 < len(segments):
-                        # 非末段：在下一段起点之前留 5s 缓冲
+                        # 非末段：在下一段起点之前留 3s 缓冲
                         next_s = segments[k + 1][0]
                         next_seg_start_t = max(0.0, ref_times[next_s] - PAD_BEFORE)
-                        seg_end_t = max(ref_times[e] + 5.0, next_seg_start_t - 5.0)
+                        seg_end_t = max(ref_times[e] + 3.0, next_seg_start_t - 3.0)
                     else:
                         # 末段：延伸到音频末尾
                         seg_end_t = audio_duration
