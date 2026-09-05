@@ -214,6 +214,82 @@ def clean_str(s):
              .replace("\r", "")
              .replace("\t", ""))
 
+def build_segments_from_ref_times(
+    sung_lines,
+    ref_times,
+    max_gap_threshold=8.0,
+    min_lines_per_segment=3,
+    max_segments=8,
+):
+    """根据参考时间戳构造分段列表（多段方案专用）。
+
+    核心思路：把所有 >max_gap_threshold 秒的间奏都视为分段断点，
+    每两个断点之间为一段，让 Whisper 逐段独立对齐，从而彻底避免
+    跨间奏的累积漂移。
+
+    返回 List[Tuple[int, int]]：每个元素是 (start_idx, end_idx) 闭区间。
+
+    兜底规则：
+    1. 兜底 1（断点过多）：总段数 >max_segments 时，只保留最大的
+       (max_segments-1) 个断点（按 gap 长度排序），避免单次请求段数爆炸。
+    2. 兜底 2（段过短）：单段 <min_lines_per_segment 行时，
+       前向扫描合并到前一段；最后做一次后向校正处理首段过短。
+
+    注意：调用方需自行保证 len(sung_lines) == len(ref_times) 且都 >= 2。
+    """
+    # 1. 找所有大间奏断点（"断点后第一行"的索引）
+    break_indices = [
+        i for i in range(1, len(ref_times))
+        if ref_times[i] - ref_times[i - 1] > max_gap_threshold
+    ]
+
+    # 没有大间奏：返回单段（调用方一般已在更上层判断走整段路径）
+    if not break_indices:
+        return [(0, len(sung_lines) - 1)]
+
+    # 2. 用全部断点构建初始分段
+    raw_segments = []
+    seg_start = 0
+    for bp in break_indices:
+        raw_segments.append((seg_start, bp - 1))
+        seg_start = bp
+    raw_segments.append((seg_start, len(sung_lines) - 1))
+
+    # 3. 兜底 1：总段数过多，只保留最大的几个断点
+    if len(raw_segments) > max_segments:
+        gaps_with_idx = sorted(
+            ((ref_times[i] - ref_times[i - 1], i) for i in range(1, len(ref_times))),
+            reverse=True,
+        )
+        # 保留 (max_segments - 1) 个最大的断点（按索引排序，方便顺序切片）
+        kept_bps = sorted([bp for _, bp in gaps_with_idx[:max_segments - 1]])
+        raw_segments = []
+        seg_start = 0
+        for bp in kept_bps:
+            raw_segments.append((seg_start, bp - 1))
+            seg_start = bp
+        raw_segments.append((seg_start, len(sung_lines) - 1))
+
+    # 4. 兜底 2：单段过短则合并到相邻段
+    # 前向扫描：把短段合并到前一段
+    segments = []
+    for s, e in raw_segments:
+        seg_len = e - s + 1
+        if seg_len < min_lines_per_segment and segments:
+            prev_s, prev_e = segments[-1]
+            segments[-1] = (prev_s, e)
+        else:
+            segments.append((s, e))
+    # 后向校正：如果首段仍过短，合并到下一段
+    if (len(segments) >= 2
+            and (segments[0][1] - segments[0][0] + 1) < min_lines_per_segment):
+        s, e = segments[0]
+        next_s, next_e = segments[1]
+        segments[1] = (s, next_e)
+        segments.pop(0)
+
+    return segments
+
 def split_line_to_segments(line):
     """将歌词行拆分为匹配段，用于逐字对齐。
 
@@ -584,12 +660,11 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
             # ===== 修复时间戳堆叠：对齐失败的词会被赋予相同时间戳，需要插值修复 =====
             all_words = fix_stacked_timestamps(all_words)
         else:
-            # ===== 参考时间戳可靠，先找最大间奏断点，再决定是否分段 =====
-            # 找最大间奏间隔作为断点后，根据歌词长度和间奏大小决定策略：
-            # - 短歌词（≤25行）或间奏小（≤8s）：整段对齐（效果更好）
-            # - 长歌词（>25行）+ 大间奏（>8s）：2 段方案（避免模型漂移）
-            # 2 段方案细节：段1 切片精确（0 到断点前参考时间），
-            # 段2 切片延伸到音频末尾（模型有足够范围识别所有歌词）。
+            # ===== 参考时间戳可靠，按所有 >8s 间奏断点分段对齐（多段方案） =====
+            # 与之前的 2 段方案区别：之前只在"最大间奏"处切一刀，
+            # 长间奏多的歌曲中后段仍然会累积漂移；现在每个 >8s 的间奏
+            # 都切开，每段独立对齐能彻底避免跨间奏漂移。
+            # 短歌词（≤25行）/ 短音频（<90s）/ 无大间奏：仍走整段对齐路径。
             audio = load_audio(audio_path)  # 16kHz numpy 数组
             audio_duration = audio.shape[0] / 16000.0
 
@@ -602,27 +677,28 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                       f"按比例缩放 ref_times (×{scale:.3f})")
                 ref_times = [t * scale for t in ref_times]
 
-            # 找最大间奏间隔作为断点
-            max_gap = 0
-            break_idx = -1
-            for i in range(1, len(ref_times)):
-                gap = ref_times[i] - ref_times[i-1]
-                if gap > max_gap:
-                    max_gap = gap
-                    break_idx = i  # 断点在第 i 行之前
-
-            # ===== 决策：整段对齐 vs 2 段方案 =====
-            # 实测短歌词（≤25行）或短音频（<90s）整段处理效果更好，强制分段反而引入边界对齐误差。
-            # 2 段方案仅适用于长歌词（>25行）+ 长音频（≥90s）+ 大间奏（>8s）的情况。
+            # ===== 多段方案参数 =====
             SHORT_LYRICS_THRESHOLD = 25
             SHORT_AUDIO_THRESHOLD = 90.0  # 秒（1分30秒）
-            MAX_GAP_THRESHOLD = 8.0
+            MAX_GAP_THRESHOLD = 8.0       # > 该值的间奏视为断点
+            MIN_LINES_PER_SEGMENT = 3     # 单段 <3 行时合并到相邻段
+            MAX_SEGMENTS = 8              # 总段数兜底上限（仅在断点过多时触发）
+
+            segments = build_segments_from_ref_times(
+                sung_lines, ref_times,
+                max_gap_threshold=MAX_GAP_THRESHOLD,
+                min_lines_per_segment=MIN_LINES_PER_SEGMENT,
+                max_segments=MAX_SEGMENTS,
+            )
+
+            # ===== 决策：整段对齐 vs 多段方案 =====
+            # 单段本身就等同于没有大间奏（build_segments 的 fallback），
+            # 此时强制走整段路径以避免不必要的边界对齐误差。
             use_single_segment = (
                 len(sung_lines) < 2
-                or break_idx < 0
+                or len(segments) < 2
                 or len(sung_lines) <= SHORT_LYRICS_THRESHOLD
                 or audio_duration < SHORT_AUDIO_THRESHOLD
-                or max_gap <= MAX_GAP_THRESHOLD
             )
 
             if use_single_segment:
@@ -633,9 +709,9 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                     reason.append(f"歌词较短（{len(sung_lines)} 行 ≤ {SHORT_LYRICS_THRESHOLD}）")
                 elif audio_duration < SHORT_AUDIO_THRESHOLD:
                     reason.append(f"音频较短（{audio_duration:.1f}s < {SHORT_AUDIO_THRESHOLD:.0f}s）")
-                elif max_gap <= MAX_GAP_THRESHOLD:
-                    reason.append(f"最大间奏仅 {max_gap:.2f}s ≤ {MAX_GAP_THRESHOLD}s")
-                print(f"🧠 {' + '.join(reason)}，跳过 2 段切分，整段对齐...")
+                elif len(segments) < 2:
+                    reason.append(f"没有 >{MAX_GAP_THRESHOLD:.0f}s 的大间奏")
+                print(f"🧠 {' + '.join(reason)}，跳过切分，整段对齐...")
                 seg_start = max(0.0, ref_times[0] - 5.0) if ref_times else 0.0
                 seg_audio = audio[int(seg_start * 16000):]
                 result = model.align(seg_audio, full_text, language=lang)
@@ -647,41 +723,47 @@ def generate_lrc_content(audio_path: str, raw_lyrics_text: str, ti: str, ar: str
                             all_words.append(w)
                 all_words = fix_stacked_timestamps(all_words)
             else:
+                # 报告分段方案（包含每个断点的间奏长度，便于排查）
+                gap_descs = ", ".join(
+                    f"{ref_times[bp]-ref_times[bp-1]:.1f}s"
+                    for bp in sorted(
+                        i for i in range(1, len(ref_times))
+                        if ref_times[i] - ref_times[i - 1] > MAX_GAP_THRESHOLD
+                    )
+                )
                 print(f"🧠 音频 {audio_duration:.1f}s（≥{SHORT_AUDIO_THRESHOLD:.0f}s），"
                       f"歌词 {len(sung_lines)} 行（>{SHORT_LYRICS_THRESHOLD}），"
-                      f"最大间奏 {max_gap:.2f}s（>{MAX_GAP_THRESHOLD}s），"
-                      f"断点在第 {break_idx} 行之前，用 2 段方案对齐...")
+                      f"检测到 {len(segments) - 1} 个 >{MAX_GAP_THRESHOLD:.0f}s 间奏"
+                      f"（{gap_descs}），用 {len(segments)} 段方案对齐...")
 
-                # 段1：断点前歌词，切片精确
-                seg1_lines = sung_lines[:break_idx]
-                # 段1起点：从第一个参考时间前留余量，而非固定从 0s 开始。
+                # ===== 逐段对齐 =====
+                # 边界 padding 沿用原 2 段方案的 PAD_BEFORE=5s 策略：
+                # - 段起点：从该段第一行参考时间前推 PAD_BEFORE
+                # - 段终点（非末段）：max(末行参考时间 + 5s, 下一段起点 - 5s)
+                # - 段终点（末段）：延伸到音频末尾，确保模型有足够范围
                 PAD_BEFORE = 5.0
-                seg1_start = max(0.0, ref_times[0] - PAD_BEFORE)
-                # 段1切片终点：在段2起点之前留固定间隔（5s），确保不重叠。
-                seg2_start = max(0.0, ref_times[break_idx] - 5.0)
-                seg1_end = max(ref_times[break_idx-1] + 5.0, seg2_start - 5.0)
-                seg1_audio = audio[int(seg1_start*16000):int(seg1_end*16000)]
-                print(f"  📄 段1（{len(seg1_lines)} 行）: [{seg1_start:.2f}s - {seg1_end:.2f}s]")
-                seg1_result = model.align(seg1_audio, "\n".join(seg1_lines), language=lang)
-                if seg1_result is not None:
-                    for seg in seg1_result.segments:
-                        for w in seg.words:
-                            w.start += seg1_start
-                            w.end += seg1_start
-                            all_words.append(w)
+                for k, (s, e) in enumerate(segments):
+                    seg_lines = sung_lines[s:e + 1]
+                    seg_start_t = max(0.0, ref_times[s] - PAD_BEFORE)
+                    if k + 1 < len(segments):
+                        # 非末段：在下一段起点之前留 5s 缓冲
+                        next_s = segments[k + 1][0]
+                        next_seg_start_t = max(0.0, ref_times[next_s] - PAD_BEFORE)
+                        seg_end_t = max(ref_times[e] + 5.0, next_seg_start_t - 5.0)
+                    else:
+                        # 末段：延伸到音频末尾
+                        seg_end_t = audio_duration
 
-                # 段2：断点后歌词，切片延伸到音频末尾
-                seg2_lines = sung_lines[break_idx:]
-                seg2_end = audio_duration
-                seg2_audio = audio[int(seg2_start*16000):int(seg2_end*16000)]
-                print(f"  📄 段2（{len(seg2_lines)} 行）: [{seg2_start:.2f}s - {seg2_end:.2f}s]")
-                seg2_result = model.align(seg2_audio, "\n".join(seg2_lines), language=lang)
-                if seg2_result is not None:
-                    for seg in seg2_result.segments:
-                        for w in seg.words:
-                            w.start += seg2_start
-                            w.end += seg2_start
-                            all_words.append(w)
+                    seg_audio = audio[int(seg_start_t * 16000):int(seg_end_t * 16000)]
+                    print(f"  📄 段{k+1}/{len(segments)}（{len(seg_lines)} 行，"
+                          f"第 {s+1}-{e+1} 行）: [{seg_start_t:.2f}s - {seg_end_t:.2f}s]")
+                    seg_result = model.align(seg_audio, "\n".join(seg_lines), language=lang)
+                    if seg_result is not None:
+                        for seg in seg_result.segments:
+                            for w in seg.words:
+                                w.start += seg_start_t
+                                w.end += seg_start_t
+                                all_words.append(w)
 
                 # ===== 修复时间戳堆叠：对齐失败的词会被赋予相同时间戳，需要插值修复 =====
                 all_words = fix_stacked_timestamps(all_words)
